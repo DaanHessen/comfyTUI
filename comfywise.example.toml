@@ -1,0 +1,34 @@
+# ComfyWise configuration
+# Installed by default as ~/.config/comfywise/config.toml
+
+comfy_dir = "/media/daanh/Shared/comfy/ComfyUI"
+python = "/home/daanh/.pyenv/versions/3.13.7/envs/venv13/bin/python"
+
+# Arguments passed directly to the venv Python executable.
+# No shell activation is required when the interpreter path is absolute.
+comfy_args = [
+  "main.py",
+  "--lowvram",
+  "--preview-method",
+  "auto",
+]
+
+# systemd/cgroup memory guard. These are system-memory limits, not VRAM limits.
+memory_high = "23G"
+memory_max = "25G"
+memory_swap_max = "3G"
+
+# Display / collection settings.
+refresh_ms = 1000
+max_log_lines = 20000
+gpu_index = 0
+
+# Local ComfyUI API used for queue/generation details in the TUI.
+api_host = "127.0.0.1"
+api_port = 8188
+
+# Last-resort global safety net. If total system MemAvailable stays below
+# this floor for N consecutive refreshes, ComfyWise stops ComfyUI.
+auto_stop_on_low_memory = true
+emergency_ram_floor_mib = 2048
+emergency_consecutive_samples = 3
