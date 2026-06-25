@@ -1701,7 +1701,7 @@ fn render_dashboard(frame: &mut Frame, area: Rect, app: &App) {
     } else {
         let columns = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(35), Constraint::Percentage(65)])
+            .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
             .split(bottom_area);
         render_hardware(frame, columns[0], app);
         if app.insights.is_empty() {
@@ -2008,67 +2008,96 @@ fn render_generation(frame: &mut Frame, area: Rect, app: &App) {
         generation.loras.join(", ")
     };
 
-    let mut left_lines = vec![
+    let mut exec_lines = vec![
         Line::from(vec![
-            Span::raw(" "),
+            Span::raw(" State    "),
             Span::styled(state, generation_state_style(state)),
-            Span::raw(format!(
-                " │ {prompt_label} {prompt_id} │ q {}+{}",
-                generation.running, generation.pending
-            )),
         ]),
         Line::from(vec![
-            Span::raw(" "),
-            Span::styled(mini_bar(progress_pct, 18), Style::default().fg(Color::Cyan)),
-            Span::raw(format!(" {progress_pct:5.1}% │ step {step_text}")),
+            Span::raw(" Queue    "),
+            Span::styled(format!("{}+{}", generation.running, generation.pending), Style::default().fg(app.colors().primary)),
         ]),
         Line::from(vec![
-            Span::raw(" Time "), Span::styled(elapsed, Style::default().fg(app.colors().primary)),
-            Span::raw(" │ ETA "), Span::styled(eta, Style::default().fg(app.colors().primary)),
+            Span::raw(" Progress "),
+            Span::styled(mini_bar(progress_pct, 15), Style::default().fg(Color::Cyan)),
+            Span::raw(format!(" {progress_pct:5.1}%")),
         ]),
         Line::from(vec![
-            Span::raw(" Sampler "), Span::styled(sampler.to_owned(), Style::default().fg(app.colors().primary)),
-            Span::raw(" │ "), Span::styled(scheduler.to_owned(), Style::default().fg(app.colors().primary)),
+            Span::raw(" Step     "),
+            Span::styled(step_text, Style::default().fg(app.colors().primary)),
         ]),
         Line::from(vec![
-            Span::raw(" CFG "), Span::styled(cfg, Style::default().fg(app.colors().primary)),
-            Span::raw(" │ den "), Span::styled(denoise, Style::default().fg(app.colors().primary)),
-            Span::raw(" │ guidance "), Span::styled(guidance, Style::default().fg(app.colors().primary)),
-            Span::raw(" │ shift "), Span::styled(shift, Style::default().fg(app.colors().primary)),
+            Span::raw(" Time     "),
+            Span::styled(elapsed, Style::default().fg(app.colors().primary)),
         ]),
         Line::from(vec![
-            Span::raw(" Seed "), Span::styled(truncate_middle(seed, available_width.saturating_sub(7)), Style::default().fg(app.colors().primary)),
+            Span::raw(" ETA      "),
+            Span::styled(eta, Style::default().fg(app.colors().primary)),
         ]),
     ];
 
-    let mut right_lines = vec![
+    let mut param_lines = vec![
         Line::from(vec![
-            Span::raw(" Image "), Span::styled(resolution, Style::default().fg(app.colors().primary)),
-            Span::raw(" │ batch "), Span::styled(batch.to_string(), Style::default().fg(app.colors().primary)),
-            Span::raw(" │ nodes "), Span::styled(format!("{nodes}/{output_nodes}"), Style::default().fg(app.colors().primary)),
+            Span::raw(" Prompt   "),
+            Span::styled(format!("{prompt_label} {prompt_id}"), Style::default().fg(app.colors().primary)),
         ]),
         Line::from(vec![
-            Span::raw(" Model "), Span::styled(truncate_middle(model, available_width.saturating_sub(8)), Style::default().fg(app.colors().primary)),
+            Span::raw(" Image    "),
+            Span::styled(resolution, Style::default().fg(app.colors().primary)),
+            Span::raw(" │ batch "),
+            Span::styled(batch.to_string(), Style::default().fg(app.colors().primary)),
         ]),
         Line::from(vec![
-            Span::raw(" Encoder "), Span::styled(truncate_middle(encoder, available_width.saturating_sub(10)), Style::default().fg(app.colors().primary)),
+            Span::raw(" Sampler  "),
+            Span::styled(format!("{sampler} │ {scheduler}"), Style::default().fg(app.colors().primary)),
         ]),
         Line::from(vec![
-            Span::raw(" VAE "), Span::styled(truncate_middle(vae, (available_width / 3).saturating_sub(5)), Style::default().fg(app.colors().primary)),
-            Span::raw(" │ LoRA "), Span::styled(truncate_middle(&loras, (available_width - available_width / 3).saturating_sub(10)), Style::default().fg(app.colors().primary)),
+            Span::raw(" CFG      "),
+            Span::styled(format!("{cfg} │ den {denoise}"), Style::default().fg(app.colors().primary)),
+        ]),
+        Line::from(vec![
+            Span::raw(" Guidance "),
+            Span::styled(format!("{guidance} │ shift {shift}"), Style::default().fg(app.colors().primary)),
+        ]),
+        Line::from(vec![
+            Span::raw(" Seed     "),
+            Span::styled(truncate_middle(seed, (available_width / 3).saturating_sub(10)), Style::default().fg(app.colors().primary)),
+        ]),
+    ];
+
+    let mut model_lines = vec![
+        Line::from(vec![
+            Span::raw(" Model    "),
+            Span::styled(truncate_middle(model, (available_width / 3).saturating_sub(10)), Style::default().fg(app.colors().primary)),
+        ]),
+        Line::from(vec![
+            Span::raw(" Encoder  "),
+            Span::styled(truncate_middle(encoder, (available_width / 3).saturating_sub(10)), Style::default().fg(app.colors().primary)),
+        ]),
+        Line::from(vec![
+            Span::raw(" VAE      "),
+            Span::styled(truncate_middle(vae, (available_width / 3).saturating_sub(10)), Style::default().fg(app.colors().primary)),
+        ]),
+        Line::from(vec![
+            Span::raw(" LoRA     "),
+            Span::styled(truncate_middle(&loras, (available_width / 3).saturating_sub(10)), Style::default().fg(app.colors().primary)),
+        ]),
+        Line::from(vec![
+            Span::raw(" Nodes    "),
+            Span::styled(format!("{nodes}/{output_nodes}"), Style::default().fg(app.colors().primary)),
         ]),
     ];
 
     if !generation.api_connected {
         if let Some(error) = &generation.api_error {
-            right_lines[3] = Line::from(Span::styled(
-                format!(" API {}", truncate_middle(error, available_width.saturating_sub(6))),
+            model_lines[4] = Line::from(Span::styled(
+                format!(" API ERROR: {}", truncate_middle(error, available_width.saturating_sub(6))),
                 Style::default().fg(Color::DarkGray),
             ));
         }
     } else if generation.running == 0 {
         if let Some(duration) = generation.last_duration {
-            left_lines[2] = Line::from(vec![Span::raw(" Last generation: "), Span::styled(format_duration(duration), Style::default().fg(app.colors().primary))]);
+            exec_lines[4] = Line::from(vec![Span::raw(" Last gen "), Span::styled(format_duration(duration), Style::default().fg(app.colors().primary))]);
         }
     }
 
@@ -2080,16 +2109,26 @@ fn render_generation(frame: &mut Frame, area: Rect, app: &App) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    if inner.width > 80 {
+    if inner.width > 120 {
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(30), Constraint::Percentage(35), Constraint::Percentage(35)])
+            .split(inner);
+        frame.render_widget(Paragraph::new(exec_lines), cols[0]);
+        frame.render_widget(Paragraph::new(param_lines), cols[1]);
+        frame.render_widget(Paragraph::new(model_lines), cols[2]);
+    } else if inner.width > 80 {
         let cols = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
             .split(inner);
-        frame.render_widget(Paragraph::new(left_lines), cols[0]);
-        frame.render_widget(Paragraph::new(right_lines), cols[1]);
+        frame.render_widget(Paragraph::new(exec_lines), cols[0]);
+        param_lines.extend(model_lines);
+        frame.render_widget(Paragraph::new(param_lines), cols[1]);
     } else {
-        left_lines.extend(right_lines);
-        frame.render_widget(Paragraph::new(left_lines), inner);
+        exec_lines.extend(param_lines);
+        exec_lines.extend(model_lines);
+        frame.render_widget(Paragraph::new(exec_lines), inner);
     }
 }
 
