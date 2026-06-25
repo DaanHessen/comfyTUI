@@ -10,7 +10,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Clear, Gauge, Paragraph, Sparkline},
+    widgets::{Block, BorderType, Borders, Clear, Paragraph},
     Frame, Terminal,
 };
 use serde::{Deserialize, Serialize};
@@ -315,13 +315,25 @@ struct PowerMetrics {
     battery_status: Option<String>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 struct SystemMetrics {
     cpu_usage: f64,
     cpu_history: VecDeque<u64>,
     memory_used: u64,
     memory_total: u64,
     memory_history: VecDeque<u64>,
+}
+
+impl Default for SystemMetrics {
+    fn default() -> Self {
+        Self {
+            cpu_usage: 0.0,
+            cpu_history: vec![0; 60].into(),
+            memory_used: 0,
+            memory_total: 0,
+            memory_history: vec![0; 60].into(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1646,8 +1658,6 @@ fn render(frame: &mut Frame, app: &App) {
 
     if app.show_help {
         render_help_modal(frame, area);
-    } else if let Some(pct) = app.boot_progress_pct {
-        render_boot_overlay(frame, area, pct);
     }
 }
 
@@ -1744,41 +1754,7 @@ fn render_settings(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(paragraph, area);
 }
 
-fn render_boot_overlay(frame: &mut Frame, area: Rect, pct: f64) {
-    let overlay_area = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage(40),
-            Constraint::Length(3),
-            Constraint::Percentage(40),
-        ])
-        .split(area)[1];
 
-    let overlay_area = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(25),
-            Constraint::Percentage(50),
-            Constraint::Percentage(25),
-        ])
-        .split(overlay_area)[1];
-
-    frame.render_widget(Clear, overlay_area);
-
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(Color::Cyan))
-        .title(" Booting ComfyUI ");
-
-    let gauge = Gauge::default()
-        .block(block)
-        .gauge_style(Style::default().fg(Color::Cyan).bg(Color::DarkGray))
-        .percent(pct as u16)
-        .label(format!("{:.1}%", pct));
-
-    frame.render_widget(gauge, overlay_area);
-}
 
 fn render_help_modal(frame: &mut Frame, area: Rect) {
     let help_text = vec![
@@ -1847,10 +1823,14 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
     let spinner = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
     let spinner_frame = spinner[(SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() / 100) as usize % spinner.len()];
     
-    let status_text = match app.status.as_str() {
-        "Starting" => format!("{} Starting", spinner_frame),
-        "Stopping" => format!("{} Stopping", spinner_frame),
-        other => other.to_owned(),
+    let status_text = if let Some(pct) = app.boot_progress_pct {
+        format!("{} Booting ({pct:.1}%)", spinner_frame)
+    } else {
+        match app.status.as_str() {
+            "Starting" => format!("{} Starting", spinner_frame),
+            "Stopping" => format!("{} Stopping", spinner_frame),
+            other => other.to_owned(),
+        }
     };
 
     let unit = app.scope_unit.as_deref().unwrap_or("no active scope");
@@ -1876,16 +1856,31 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
         )));
     }
 
-    frame.render_widget(
-        Paragraph::new(lines).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(Color::DarkGray))
-                .title(" Session ")
-        ),
-        area,
-    );
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::DarkGray))
+        .title(" Session ");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let layout = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(0), Constraint::Length(38)])
+        .split(inner);
+
+    frame.render_widget(Paragraph::new(lines), layout[0]);
+
+    let tabs = ratatui::widgets::Tabs::new(vec![" 1 Dashboard ", " 2 Logs ", " 3 Settings "])
+        .select(match app.tab {
+            Tab::Dashboard => 0,
+            Tab::Logs => 1,
+            Tab::Settings => 2,
+        })
+        .style(Style::default().fg(Color::DarkGray))
+        .highlight_style(Style::default().fg(app.colors().primary).add_modifier(Modifier::BOLD))
+        .divider("│");
+    frame.render_widget(tabs, layout[1]);
 }
 
 fn render_diagnostics(frame: &mut Frame, area: Rect, app: &App) {
@@ -2071,11 +2066,18 @@ fn render_cpu(frame: &mut Frame, area: Rect, app: &App) {
         frame.render_widget(Paragraph::new(lines), layout[0]);
 
         let history: Vec<u64> = metrics.system.cpu_history.iter().copied().collect();
-        let sparkline = Sparkline::default()
+        let sparkline_block = Block::default()
+            .borders(Borders::LEFT)
+            .border_style(Style::default().fg(Color::DarkGray))
+            .title(Span::styled(" Hist ", Style::default().fg(Color::DarkGray)));
+        let sparkline_inner = sparkline_block.inner(layout[1]);
+        frame.render_widget(sparkline_block, layout[1]);
+
+        let sparkline = ratatui::widgets::Sparkline::default()
             .data(&history)
             .max(100)
             .style(Style::default().fg(app.colors().primary));
-        frame.render_widget(sparkline, layout[1]);
+        frame.render_widget(sparkline, sparkline_inner);
     } else {
         let lines = vec![
             usage_line("USAGE", cpu.usage_pct),
@@ -2144,11 +2146,18 @@ fn render_gpu(frame: &mut Frame, area: Rect, app: &App) {
         frame.render_widget(Paragraph::new(lines), layout[0]);
 
         let history: Vec<u64> = gpu.gpu_history.iter().copied().collect();
-        let sparkline = Sparkline::default()
+        let sparkline_block = Block::default()
+            .borders(Borders::LEFT)
+            .border_style(Style::default().fg(Color::DarkGray))
+            .title(Span::styled(" Hist ", Style::default().fg(Color::DarkGray)));
+        let sparkline_inner = sparkline_block.inner(layout[1]);
+        frame.render_widget(sparkline_block, layout[1]);
+
+        let sparkline = ratatui::widgets::Sparkline::default()
             .data(&history)
             .max(100)
             .style(Style::default().fg(app.colors().primary));
-        frame.render_widget(sparkline, layout[1]);
+        frame.render_widget(sparkline, sparkline_inner);
     } else {
         let lines = vec![
             Line::from(format!(" {}", gpu.name)),
@@ -2227,11 +2236,18 @@ fn render_memory(frame: &mut Frame, area: Rect, app: &App) {
         frame.render_widget(Paragraph::new(lines), layout[0]);
 
         let history: Vec<u64> = metrics.system.memory_history.iter().copied().collect();
-        let sparkline = Sparkline::default()
+        let sparkline_block = Block::default()
+            .borders(Borders::LEFT)
+            .border_style(Style::default().fg(Color::DarkGray))
+            .title(Span::styled(" Hist ", Style::default().fg(Color::DarkGray)));
+        let sparkline_inner = sparkline_block.inner(layout[1]);
+        frame.render_widget(sparkline_block, layout[1]);
+
+        let sparkline = ratatui::widgets::Sparkline::default()
             .data(&history)
             .max(100)
             .style(Style::default().fg(app.colors().primary));
-        frame.render_widget(sparkline, layout[1]);
+        frame.render_widget(sparkline, sparkline_inner);
     } else {
         let lines = vec![
             usage_line("RAM", ram_pct),
@@ -3109,8 +3125,8 @@ fn collect_gpu(index: u32) -> GpuMetrics {
 
     GpuMetrics {
         available: true,
-        gpu_history: std::collections::VecDeque::new(),
-        vram_history: std::collections::VecDeque::new(),
+        gpu_history: vec![0; 60].into(),
+        vram_history: vec![0; 60].into(),
         name: fields[0].to_owned(),
         temperature_c: parse_optional_f64(fields[1]),
         utilization_pct: parse_optional_f64(fields[2]),
