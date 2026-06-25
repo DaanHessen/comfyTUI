@@ -6,12 +6,12 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::{
+    Frame, Terminal,
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Clear, Gauge, Paragraph, Sparkline},
-    Frame, Terminal,
+    widgets::{Block, Borders, BorderType, Paragraph, Tabs},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -22,7 +22,7 @@ use std::{
     net::{TcpStream, ToSocketAddrs},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    sync::mpsc::{self, Sender},
+    sync::mpsc::{self, Receiver, Sender},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -30,72 +30,76 @@ use std::{
 const APP_NAME: &str = "ComfyTUI";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(rename_all = "lowercase")]
 enum Theme {
+    #[default]
     Default,
     Catppuccin,
     Dracula,
     Gruvbox,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+enum Tab {
+    Dashboard,
+    Logs,
+    Settings,
+}
+
 struct ThemeColors {
-    primary: Color,
-    secondary: Color,
-    background: Color,
     text: Color,
     border: Color,
-    success: Color,
-    warning: Color,
+    highlight: Color,
     error: Color,
-    info: Color,
+    warning: Color,
+    success: Color,
+    accent: Color,
+    bg: Color,
 }
 
 impl Theme {
     fn colors(&self) -> ThemeColors {
         match self {
             Theme::Default => ThemeColors {
-                primary: Color::Cyan,
-                secondary: Color::Blue,
-                background: Color::Reset,
                 text: Color::Reset,
                 border: Color::DarkGray,
-                success: Color::Green,
-                warning: Color::Yellow,
+                highlight: Color::Cyan,
                 error: Color::Red,
-                info: Color::LightBlue,
+                warning: Color::LightYellow,
+                success: Color::Green,
+                accent: Color::LightBlue,
+                bg: Color::Reset,
             },
             Theme::Catppuccin => ThemeColors {
-                primary: Color::Rgb(203, 166, 247), // Mauve
-                secondary: Color::Rgb(137, 180, 250), // Blue
-                background: Color::Rgb(30, 30, 46), // Base
-                text: Color::Rgb(205, 214, 244), // Text
-                border: Color::Rgb(88, 91, 112), // Surface2
-                success: Color::Rgb(166, 227, 161), // Green
-                warning: Color::Rgb(249, 226, 175), // Yellow
-                error: Color::Rgb(243, 139, 168), // Red
-                info: Color::Rgb(137, 180, 250), // Blue
+                text: Color::Rgb(202, 211, 245),
+                border: Color::Rgb(128, 135, 162),
+                highlight: Color::Rgb(138, 173, 244),
+                error: Color::Rgb(237, 135, 150),
+                warning: Color::Rgb(238, 212, 159),
+                success: Color::Rgb(166, 218, 149),
+                accent: Color::Rgb(198, 160, 246),
+                bg: Color::Rgb(36, 39, 58),
             },
             Theme::Dracula => ThemeColors {
-                primary: Color::Rgb(189, 147, 249), // Purple
-                secondary: Color::Rgb(139, 233, 253), // Cyan
-                background: Color::Rgb(40, 42, 54), // Background
-                text: Color::Rgb(248, 248, 242), // Foreground
-                border: Color::Rgb(98, 114, 164), // Comment
-                success: Color::Rgb(80, 250, 123), // Green
-                warning: Color::Rgb(241, 250, 140), // Yellow
-                error: Color::Rgb(255, 85, 85), // Red
-                info: Color::Rgb(139, 233, 253), // Cyan
+                text: Color::Rgb(248, 248, 242),
+                border: Color::Rgb(98, 114, 164),
+                highlight: Color::Rgb(139, 233, 253),
+                error: Color::Rgb(255, 85, 85),
+                warning: Color::Rgb(241, 250, 140),
+                success: Color::Rgb(80, 250, 123),
+                accent: Color::Rgb(189, 147, 249),
+                bg: Color::Rgb(40, 42, 54),
             },
             Theme::Gruvbox => ThemeColors {
-                primary: Color::Rgb(211, 134, 155), // Purple
-                secondary: Color::Rgb(131, 165, 152), // Blue
-                background: Color::Rgb(40, 40, 40), // Background
-                text: Color::Rgb(235, 219, 178), // Foreground
-                border: Color::Rgb(146, 131, 116), // Gray
-                success: Color::Rgb(184, 187, 38), // Green
-                warning: Color::Rgb(250, 189, 47), // Yellow
-                error: Color::Rgb(251, 73, 52), // Red
-                info: Color::Rgb(131, 165, 152), // Blue
+                text: Color::Rgb(235, 219, 178),
+                border: Color::Rgb(146, 131, 116),
+                highlight: Color::Rgb(131, 165, 152),
+                error: Color::Rgb(204, 36, 29),
+                warning: Color::Rgb(250, 189, 47),
+                success: Color::Rgb(184, 187, 38),
+                accent: Color::Rgb(211, 134, 155),
+                bg: Color::Rgb(40, 40, 40),
             },
         }
     }
@@ -119,12 +123,7 @@ struct Config {
     emergency_ram_floor_mib: u64,
     emergency_consecutive_samples: u32,
     theme: Theme,
-    #[serde(default = "default_sparklines")]
     sparklines_enabled: bool,
-}
-
-fn default_sparklines() -> bool {
-    true
 }
 
 impl Default for Config {
@@ -264,12 +263,10 @@ struct GpuMetrics {
     available: bool,
     name: String,
     utilization_pct: Option<f64>,
-    gpu_history: VecDeque<u64>,
     temperature_c: Option<f64>,
     vram_total: Option<u64>,
     vram_used: Option<u64>,
     vram_free: Option<u64>,
-    vram_history: VecDeque<u64>,
     power_draw_w: Option<f64>,
     power_limit_w: Option<f64>,
     fan_pct: Option<f64>,
@@ -315,14 +312,6 @@ struct PowerMetrics {
     battery_status: Option<String>,
 }
 
-#[derive(Debug, Clone, Default)]
-struct SystemMetrics {
-    cpu_usage: f64,
-    cpu_history: VecDeque<u64>,
-    memory_used: u64,
-    memory_total: u64,
-    memory_history: VecDeque<u64>,
-}
 
 #[derive(Debug, Clone, Default)]
 struct GenerationMetrics {
@@ -392,6 +381,13 @@ struct VmCounters {
 }
 
 #[derive(Debug, Clone, Default)]
+struct HistoryMetrics {
+    cpu_usage: Vec<u64>,
+    ram_usage: Vec<u64>,
+    vram_usage: Vec<u64>,
+}
+
+#[derive(Debug, Clone, Default)]
 struct Metrics {
     cpu: CpuMetrics,
     memory: MemoryMetrics,
@@ -399,7 +395,7 @@ struct Metrics {
     scope: ScopeMetrics,
     disk: DiskMetrics,
     power: PowerMetrics,
-    system: SystemMetrics,
+    history: HistoryMetrics,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -412,6 +408,7 @@ struct MetricsCollector {
     previous_cpu: Option<CpuTimes>,
     previous_vm: Option<(VmCounters, Instant)>,
     previous_scope_cpu: Option<(String, u64, Instant)>,
+    history: HistoryMetrics,
 }
 
 impl MetricsCollector {
@@ -420,24 +417,47 @@ impl MetricsCollector {
             previous_cpu: None,
             previous_vm: None,
             previous_scope_cpu: None,
+            history: HistoryMetrics::default(),
         }
     }
 
-    fn collect_all(&mut self, scope_unit: Option<&str>) -> Metrics {
+    fn collect(&mut self, config: &Config, scope_unit: Option<&str>) -> Metrics {
         let mut memory = collect_memory();
         self.apply_vm_rates(&mut memory);
 
         let mut scope = scope_unit.map(collect_scope).unwrap_or_default();
         self.apply_scope_cpu_rate(scope_unit, &mut scope);
 
+        let cpu = self.collect_cpu();
+        let gpu = collect_gpu(config.gpu_index);
+
+        if config.sparklines_enabled {
+            self.history.cpu_usage.push(cpu.usage_pct as u64);
+            if self.history.cpu_usage.len() > 100 { self.history.cpu_usage.remove(0); }
+
+            let ram_pct = if memory.total > 0 { (memory.used as f64 / memory.total as f64 * 100.0) as u64 } else { 0 };
+            self.history.ram_usage.push(ram_pct);
+            if self.history.ram_usage.len() > 100 { self.history.ram_usage.remove(0); }
+
+            if let (Some(used), Some(total)) = (gpu.vram_used, gpu.vram_total) {
+                let vram_pct = if total > 0 { (used as f64 / total as f64 * 100.0) as u64 } else { 0 };
+                self.history.vram_usage.push(vram_pct);
+                if self.history.vram_usage.len() > 100 { self.history.vram_usage.remove(0); }
+            }
+        } else {
+            self.history.cpu_usage.clear();
+            self.history.ram_usage.clear();
+            self.history.vram_usage.clear();
+        }
+
         Metrics {
-            cpu: self.collect_cpu(),
+            cpu,
             memory,
-            gpu: collect_gpu(0),
+            gpu,
             scope,
-            disk: collect_disk(&PathBuf::from("/")),
+            disk: collect_disk(&config.comfy_dir),
             power: collect_power(),
-            system: SystemMetrics::default(),
+            history: self.history.clone(),
         }
     }
 
@@ -520,21 +540,14 @@ impl MetricsCollector {
     }
 }
 
-#[derive(PartialEq)]
-enum Tab {
-    Dashboard,
-    Logs,
-    Settings,
-}
-
 struct App {
     config: Config,
     config_path: PathBuf,
     child: Option<Child>,
     scope_unit: Option<String>,
     run_number: u32,
-    tx: mpsc::Sender<LogEvent>,
-    rx: mpsc::Receiver<LogEvent>,
+    tx: Sender<LogEvent>,
+    rx: Receiver<LogEvent>,
     logs: VecDeque<LogEvent>,
     max_log_lines: usize,
     follow_logs: bool,
@@ -556,18 +569,14 @@ struct App {
     search_mode: bool,
     show_help: bool,
     insights: Vec<String>,
-    boot_progress_pct: Option<f64>,
     tab: Tab,
     settings_index: usize,
     settings_edit_mode: bool,
     settings_input: String,
+    boot_progress_pct: Option<f64>,
 }
 
 impl App {
-    fn colors(&self) -> ThemeColors {
-        self.config.theme.colors()
-    }
-
     fn new(config: Config, config_path: PathBuf) -> Self {
         let (tx, rx) = mpsc::channel();
         let max_log_lines = config.max_log_lines;
@@ -600,11 +609,11 @@ impl App {
             search_mode: false,
             show_help: false,
             insights: Vec::new(),
-            boot_progress_pct: None,
             tab: Tab::Dashboard,
             settings_index: 0,
             settings_edit_mode: false,
             settings_input: String::new(),
+            boot_progress_pct: None,
         }
     }
 
@@ -722,7 +731,7 @@ impl App {
         if Instant::now() >= deadline {
             if self.shutdown_step == 1 {
                 self.push_warning(format!("{unit} did not stop after SIGINT; asking systemd to stop it"));
-                let _ = systemctl(&["--user", "stop", "--no-block", &unit]);
+                let _ = systemctl(&["--user", "stop", &unit]);
                 self.shutdown_step = 2;
                 self.shutdown_deadline = Some(Instant::now() + Duration::from_secs(2));
             } else if self.shutdown_step == 2 {
@@ -741,7 +750,7 @@ impl App {
                 "--signal=SIGKILL",
                 &unit,
             ]);
-            let _ = systemctl(&["--user", "stop", "--no-block", &unit]);
+            let _ = systemctl(&["--user", "stop", &unit]);
             self.push_warning(format!("Force-stopped {unit}"));
         }
         if let Some(child) = self.child.as_mut() {
@@ -774,7 +783,6 @@ impl App {
             6 => self.config.emergency_ram_floor_mib.to_string(),
             7 => self.config.emergency_consecutive_samples.to_string(),
             8 => self.config.sparklines_enabled.to_string(),
-            9 => format!("{:?}", self.config.theme),
             _ => String::new(),
         }
     }
@@ -783,14 +791,6 @@ impl App {
         match index {
             5 => self.config.auto_stop_on_low_memory = !self.config.auto_stop_on_low_memory,
             8 => self.config.sparklines_enabled = !self.config.sparklines_enabled,
-            9 => {
-                self.config.theme = match self.config.theme {
-                    Theme::Default => Theme::Catppuccin,
-                    Theme::Catppuccin => Theme::Dracula,
-                    Theme::Dracula => Theme::Gruvbox,
-                    Theme::Gruvbox => Theme::Default,
-                };
-            }
             _ => {}
         }
         self.save_config();
@@ -807,8 +807,10 @@ impl App {
             2 => self.config.memory_high = val,
             3 => self.config.memory_max = val,
             4 => self.config.memory_swap_max = val,
+            5 => if let Ok(v) = val.parse() { self.config.auto_stop_on_low_memory = v; }
             6 => if let Ok(v) = val.parse() { self.config.emergency_ram_floor_mib = v; }
             7 => if let Ok(v) = val.parse() { self.config.emergency_consecutive_samples = v; }
+            8 => if let Ok(v) = val.parse() { self.config.sparklines_enabled = v; }
             _ => {}
         }
         self.save_config();
@@ -866,7 +868,7 @@ impl App {
                 }
             }
 
-            if text_lower.contains("import failed") 
+            if text_lower.contains("import failed")  
                 || text_lower.contains("exception:") 
                 || text_lower.contains("no module named") 
                 || text_lower.contains("traceback (most recent call last)")
@@ -960,35 +962,15 @@ impl App {
     }
 
     fn refresh_metrics_if_due(&mut self) {
-        if self.last_metrics_refresh.elapsed() >= Duration::from_millis(self.config.refresh_ms) {
-            let mut new_metrics = self.collector.collect_all(self.scope_unit.as_deref());
-            
-            // Persist history
-            new_metrics.system.cpu_history = self.metrics.system.cpu_history.clone();
-            new_metrics.system.memory_history = self.metrics.system.memory_history.clone();
-            if new_metrics.system.cpu_history.len() >= 60 { new_metrics.system.cpu_history.pop_front(); }
-            new_metrics.system.cpu_history.push_back(new_metrics.system.cpu_usage as u64);
-            if new_metrics.system.memory_history.len() >= 60 { new_metrics.system.memory_history.pop_front(); }
-            new_metrics.system.memory_history.push_back((new_metrics.system.memory_used as f64 / new_metrics.system.memory_total as f64 * 100.0) as u64);
-            
-            // Note: Assuming GpuMetrics fields gpu_history/vram_history exist as per requirements
-            if new_metrics.gpu.available {
-                new_metrics.gpu.gpu_history = self.metrics.gpu.gpu_history.clone();
-                new_metrics.gpu.vram_history = self.metrics.gpu.vram_history.clone();
-                if new_metrics.gpu.gpu_history.len() >= 60 { new_metrics.gpu.gpu_history.pop_front(); }
-                new_metrics.gpu.gpu_history.push_back(new_metrics.gpu.utilization_pct.unwrap_or(0.0) as u64);
-                if new_metrics.gpu.vram_history.len() >= 60 { new_metrics.gpu.vram_history.pop_front(); }
-                let vram_pct = if new_metrics.gpu.vram_total.unwrap_or(0) > 0 { 
-                    (new_metrics.gpu.vram_used.unwrap_or(0) as f64 / new_metrics.gpu.vram_total.unwrap_or(1) as f64 * 100.0) as u64 
-                } else { 0 };
-                new_metrics.gpu.vram_history.push_back(vram_pct);
-            }
-
-            self.metrics = new_metrics;
-            let generation = collect_generation_snapshot(&self.config);
-            self.update_generation_snapshot(generation);
-            self.last_metrics_refresh = Instant::now();
+        if self.last_metrics_refresh.elapsed() < Duration::from_millis(self.config.refresh_ms) {
+            return;
         }
+        self.metrics = self
+            .collector
+            .collect(&self.config, self.scope_unit.as_deref());
+        let generation = collect_generation_snapshot(&self.config);
+        self.update_generation_snapshot(generation);
+        self.last_metrics_refresh = Instant::now();
         self.apply_low_memory_watchdog();
     }
 
@@ -1198,6 +1180,50 @@ impl App {
         if success {
             self.push_system(format!("Setting updated: {} = {}", key, value));
         }
+    }
+
+    fn get_setting_string(&self, index: usize) -> String {
+        match index {
+            0 => self.config.refresh_ms.to_string(),
+            1 => self.config.max_log_lines.to_string(),
+            2 => self.config.memory_high.clone(),
+            3 => self.config.memory_max.clone(),
+            4 => self.config.memory_swap_max.clone(),
+            5 => self.config.auto_stop_on_low_memory.to_string(),
+            6 => self.config.emergency_ram_floor_mib.to_string(),
+            7 => self.config.emergency_consecutive_samples.to_string(),
+            8 => self.config.sparklines_enabled.to_string(),
+            _ => String::new(),
+        }
+    }
+
+    fn toggle_setting(&mut self, index: usize) {
+        match index {
+            5 => self.config.auto_stop_on_low_memory = !self.config.auto_stop_on_low_memory,
+            8 => self.config.sparklines_enabled = !self.config.sparklines_enabled,
+            _ => {}
+        }
+        self.save_config();
+    }
+
+    fn save_setting(&mut self) {
+        let val = self.settings_input.clone();
+        match self.settings_index {
+            0 => if let Ok(v) = val.parse() { self.config.refresh_ms = v; }
+            1 => if let Ok(v) = val.parse() {
+                self.config.max_log_lines = v;
+                self.max_log_lines = v;
+            }
+            2 => self.config.memory_high = val,
+            3 => self.config.memory_max = val,
+            4 => self.config.memory_swap_max = val,
+            5 => if let Ok(v) = val.parse() { self.config.auto_stop_on_low_memory = v; }
+            6 => if let Ok(v) = val.parse() { self.config.emergency_ram_floor_mib = v; }
+            7 => if let Ok(v) = val.parse() { self.config.emergency_consecutive_samples = v; }
+            8 => if let Ok(v) = val.parse() { self.config.sparklines_enabled = v; }
+            _ => {}
+        }
+        self.save_config();
     }
 
     fn save_config(&mut self) {
@@ -1455,15 +1481,12 @@ fn run_ui(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> R
                 }
             }
             continue;
-        } else if let Some(mut input) = app.search_input.take() {
+        } else if app.search_mode {
+            let mut input = app.search_input.take().unwrap_or_default();
             match key.code {
-                KeyCode::Esc => {
+                KeyCode::Esc | KeyCode::Enter => {
                     app.search_mode = false;
-                }
-                KeyCode::Enter => {
-                    app.search_mode = false;
-                    app.search_input = Some(input); // keep the input for the filter
-                    app.tab = Tab::Logs;
+                    app.search_input = if input.is_empty() { None } else { Some(input) };
                 }
                 KeyCode::Backspace => {
                     input.pop();
@@ -1478,8 +1501,12 @@ fn run_ui(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> R
                 }
             }
             continue;
+        } else if let Some(_) = app.search_input {
+            if key.code == KeyCode::Esc {
+                app.search_input = None;
+                continue;
+            }
         }
-
 
         if app.tab == Tab::Settings {
             if app.settings_edit_mode {
@@ -1497,13 +1524,13 @@ fn run_ui(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> R
             } else {
                 match key.code {
                     KeyCode::Up => { app.settings_index = app.settings_index.saturating_sub(1); }
-                    KeyCode::Down => { app.settings_index = (app.settings_index + 1).min(9); }
+                    KeyCode::Down => { app.settings_index = (app.settings_index + 1).min(8); }
                     KeyCode::Enter => {
                         app.settings_edit_mode = true;
                         app.settings_input = app.get_setting_string(app.settings_index);
                     }
                     KeyCode::Char(' ') => {
-                        if app.settings_index == 5 || app.settings_index == 8 || app.settings_index == 9 {
+                        if app.settings_index == 5 || app.settings_index == 8 {
                             app.toggle_setting(app.settings_index);
                         }
                     }
@@ -1553,7 +1580,9 @@ fn run_ui(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> R
                 ..
             } => {
                 app.search_mode = true;
-                app.search_input = Some(String::new());
+                if app.search_input.is_none() {
+                    app.search_input = Some(String::new());
+                }
                 app.tab = Tab::Logs;
             }
             KeyEvent {
@@ -1702,12 +1731,11 @@ fn render_settings(frame: &mut Frame, area: Rect, app: &App) {
         ("Emergency RAM Floor (MiB)", app.config.emergency_ram_floor_mib.to_string()),
         ("Emergency Consecutive Samples", app.config.emergency_consecutive_samples.to_string()),
         ("Show Hardware Sparklines", app.config.sparklines_enabled.to_string()),
-        ("Theme", format!("{:?}", app.config.theme)),
     ];
 
     let mut list_items = Vec::new();
     list_items.push(Line::from(vec![
-        Span::styled("Use ↑/↓ to navigate, Enter to edit, Space to toggle booleans/enums.", Style::default().fg(app.colors().border)),
+        Span::styled("Use ↑/↓ to navigate, Enter to edit, Space to toggle booleans.", Style::default().fg(Color::DarkGray)),
     ]));
     list_items.push(Line::from(""));
 
@@ -1722,7 +1750,7 @@ fn render_settings(frame: &mut Frame, area: Rect, app: &App) {
         };
 
         let style = if is_selected {
-            Style::default().fg(app.colors().primary).add_modifier(Modifier::BOLD)
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
         } else {
             Style::default()
         };
@@ -1738,46 +1766,9 @@ fn render_settings(frame: &mut Frame, area: Rect, app: &App) {
         Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
-            .title(Span::styled(" SETTINGS ", Style::default().fg(app.colors().primary).add_modifier(Modifier::BOLD)))
-            .border_style(Style::default().fg(app.colors().border))
+            .title(Span::styled(" SETTINGS ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)))
     );
     frame.render_widget(paragraph, area);
-}
-
-fn render_boot_overlay(frame: &mut Frame, area: Rect, pct: f64) {
-    let overlay_area = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage(40),
-            Constraint::Length(3),
-            Constraint::Percentage(40),
-        ])
-        .split(area)[1];
-
-    let overlay_area = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(25),
-            Constraint::Percentage(50),
-            Constraint::Percentage(25),
-        ])
-        .split(overlay_area)[1];
-
-    frame.render_widget(Clear, overlay_area);
-
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(Color::Cyan))
-        .title(" Booting ComfyUI ");
-
-    let gauge = Gauge::default()
-        .block(block)
-        .gauge_style(Style::default().fg(Color::Cyan).bg(Color::DarkGray))
-        .percent(pct as u16)
-        .label(format!("{:.1}%", pct));
-
-    frame.render_widget(gauge, overlay_area);
 }
 
 fn render_help_modal(frame: &mut Frame, area: Rect) {
@@ -1832,6 +1823,7 @@ fn render_help_modal(frame: &mut Frame, area: Rect) {
         ])
         .split(vertical_center[1]);
 
+    use ratatui::widgets::Clear;
     frame.render_widget(Clear, horizontal_center[1]);
     frame.render_widget(paragraph, horizontal_center[1]);
 }
@@ -1901,9 +1893,9 @@ fn render_diagnostics(frame: &mut Frame, area: Rect, app: &App) {
         .split(area);
 
     render_generation(frame, rows[0], app);
-    render_gpu(frame, rows[1], app);
-    render_memory(frame, rows[2], app);
-    render_cpu(frame, rows[3], app);
+    render_gpu(frame, rows[1], &app.metrics);
+    render_memory(frame, rows[2], &app.metrics);
+    render_cpu(frame, rows[3], &app.metrics);
     render_guard(frame, rows[4], app);
 }
 
@@ -2038,231 +2030,209 @@ fn render_generation(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(panel(" GENERATION ", lines), area);
 }
 
-fn render_cpu(frame: &mut Frame, area: Rect, app: &App) {
-    let metrics = &app.metrics;
+fn render_cpu(frame: &mut Frame, area: Rect, metrics: &Metrics) {
     let cpu = &metrics.cpu;
-    let temp = cpu.temp_c.map_or_else(|| "N/A".to_owned(), |v| format!("{v:.0}°C"));
-    let frequency = cpu.frequency_mhz.map_or_else(|| "N/A".to_owned(), |v| format!("{v:.0} MHz"));
+    let temp = cpu
+        .temp_c
+        .map_or_else(|| "N/A".to_owned(), |v| format!("{v:.0}°C"));
+    let frequency = cpu
+        .frequency_mhz
+        .map_or_else(|| "N/A".to_owned(), |v| format!("{v:.0} MHz"));
     let load = match (cpu.load_1, cpu.load_5, cpu.load_15) {
         (Some(a), Some(b), Some(c)) => format!("{a:.2} / {b:.2} / {c:.2}"),
         _ => "N/A".to_owned(),
     };
+    };
+    let ac: String = metrics.power.ac_online.map_or_else(
+        || "AC ?".to_owned(),
+        |online| {
+            if online {
+                "AC online".to_owned()
+            } else {
+                "Battery".to_owned()
+            }
+        },
+    );
+    let battery = metrics.power.battery_pct.map_or_else(String::new, |pct| {
+        format!(" │ {pct}% {}", metrics.power.battery_status.as_deref().unwrap_or(""))
+    });
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .title(Span::styled(" CPU ", Style::default().fg(app.colors().primary)))
-        .border_style(Style::default().fg(app.colors().border));
-
-    if app.config.sparklines_enabled {
+    let lines = vec![
+        usage_line("CPU", cpu.usage_pct),
+        Line::from(format!(" Temp {temp:<8} │ Avg clock {frequency}")),
+        Line::from(format!(" Load 1/5/15: {load}")),
+        Line::from(format!(" Power: {ac}{battery}")),
+    ];
+    
+    if metrics.history.cpu_usage.is_empty() {
+        frame.render_widget(panel(" CPU / SYSTEM ", lines), area);
+    } else {
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(Color::DarkGray))
+            .title(Span::styled(" CPU / SYSTEM ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)));
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
-        let layout = Layout::default()
+        let split = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(70), Constraint::Percentage(30)])
             .split(inner);
+        
+        frame.render_widget(Paragraph::new(lines), split[0]);
 
-        let lines = vec![
-            usage_line("USAGE", cpu.usage_pct),
-            Line::from(format!(" Temp {temp:<8} │ Avg clock {frequency}")),
-            Line::from(format!(" Load 1/5/15: {load}")),
-        ];
-        frame.render_widget(Paragraph::new(lines), layout[0]);
-
-        let history: Vec<u64> = metrics.system.cpu_history.iter().copied().collect();
-        let sparkline = Sparkline::default()
-            .data(&history)
+        let sparkline = ratatui::widgets::Sparkline::default()
+            .block(Block::default().title(" CPU Hist ").borders(Borders::LEFT).border_style(Style::default().fg(Color::DarkGray)))
+            .data(metrics.history.cpu_usage.as_slice())
             .max(100)
-            .style(Style::default().fg(app.colors().primary));
-        frame.render_widget(sparkline, layout[1]);
-    } else {
-        let lines = vec![
-            usage_line("USAGE", cpu.usage_pct),
-            Line::from(format!(" Temp {temp:<8} │ Avg clock {frequency}")),
-            Line::from(format!(" Load 1/5/15: {load}")),
-        ];
-        frame.render_widget(Paragraph::new(lines).block(block), area);
+            .style(Style::default().fg(Color::LightCyan));
+        frame.render_widget(sparkline, split[1]);
     }
 }
 
-fn render_gpu(frame: &mut Frame, area: Rect, app: &App) {
-    let metrics = &app.metrics;
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .title(Span::styled(" GPU ", Style::default().fg(app.colors().primary)))
-        .border_style(Style::default().fg(app.colors().border));
-    
+fn render_gpu(frame: &mut Frame, area: Rect, metrics: &Metrics) {
     let gpu = &metrics.gpu;
-
     if !gpu.available {
-        let err = gpu.error.as_deref().unwrap_or("Unknown error");
-        let text = format!(" Failed to query GPU:\n {}", err);
+        let message = gpu.error.as_deref().unwrap_or("nvidia-smi unavailable");
         frame.render_widget(
-            Paragraph::new(text)
-                .style(Style::default().fg(app.colors().error))
-                .block(block),
+            panel(
+                " NVIDIA GPU ",
+                vec![
+                    Line::from(Span::styled(" GPU metrics unavailable", Style::default().fg(Color::Red))),
+                    Line::from(format!(" {message}")),
+                ],
+            ),
             area,
         );
         return;
     }
 
+    let util = gpu.utilization_pct.unwrap_or(0.0);
+    let vram_pct = percent(gpu.vram_used.unwrap_or(0), gpu.vram_total.unwrap_or(0));
+    let temp = gpu
+        .temperature_c
+        .map_or_else(|| "N/A".to_owned(), |v| format!("{v:.0}°C"));
     let pstate = gpu.pstate.as_deref().unwrap_or("N/A");
-    let clock = gpu.graphics_clock_mhz.map_or_else(|| "N/A".to_owned(), |v| format!("{v:.0} MHz"));
-    let fan = gpu.fan_pct.map_or_else(|| "N/A".to_owned(), |v| format!("{v:.0}%"));
+    let used = gpu.vram_used.map_or_else(|| "N/A".to_owned(), human_bytes);
+    let free = gpu.vram_free.map_or_else(|| "N/A".to_owned(), human_bytes);
+    let power = gpu
+        .power_draw_w
+        .map_or_else(|| "N/A".to_owned(), |v| format!("{v:.1} W"));
+    let limit = gpu
+        .power_limit_w
+        .map_or_else(|| "N/A".to_owned(), |v| format!("{v:.0} W"));
+    let clock = gpu
+        .graphics_clock_mhz
+        .map_or_else(|| "N/A".to_owned(), |v| format!("{v:.0} MHz"));
+    let fan = gpu
+        .fan_pct
+        .map_or_else(|| "N/A".to_owned(), |v| format!("{v:.0}%"));
 
-    if app.config.sparklines_enabled {
+    let lines = vec![
+        Line::from(Span::styled(
+            format!(" {}", gpu.name),
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        )),
+        usage_line("GPU", util),
+        usage_line("VRAM", vram_pct),
+        Line::from(format!(" VRAM {used} used │ {free} free")),
+        Line::from(format!(" Temp {temp} │ {pstate} │ {clock}")),
+        Line::from(format!(" Power {power}/{limit} │ Fan {fan}")),
+    ];
+
+    if metrics.history.vram_usage.is_empty() {
+        frame.render_widget(panel(" NVIDIA GPU ", lines), area);
+    } else {
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(Color::DarkGray))
+            .title(Span::styled(" NVIDIA GPU ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)));
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
-        let layout = Layout::default()
+        let split = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(70), Constraint::Percentage(30)])
             .split(inner);
+        
+        frame.render_widget(Paragraph::new(lines), split[0]);
 
-        let lines = vec![
-            Line::from(format!(" {}", gpu.name)),
-            usage_line("USAGE", gpu.utilization_pct.unwrap_or(0.0)),
-            usage_line(
-                "VRAM ",
-                percent(gpu.vram_used.unwrap_or(0), gpu.vram_total.unwrap_or(1)),
-            ),
-            Line::from(format!(
-                " {} / {}",
-                human_bytes(gpu.vram_used.unwrap_or(0)),
-                human_bytes(gpu.vram_total.unwrap_or(0))
-            )),
-            Line::from(format!(
-                " Temp: {}°C │ Power: {}W / {}W",
-                format_optional_decimal(gpu.temperature_c),
-                format_optional_decimal(gpu.power_draw_w),
-                format_optional_decimal(gpu.power_limit_w),
-            )),
-            Line::from(format!(" Pstate: {pstate} │ Clock: {clock} │ Fan: {fan}")),
-        ];
-        frame.render_widget(Paragraph::new(lines), layout[0]);
-
-        let history: Vec<u64> = gpu.gpu_history.iter().copied().collect();
-        let sparkline = Sparkline::default()
-            .data(&history)
+        let sparkline = ratatui::widgets::Sparkline::default()
+            .block(Block::default().title(" VRAM Hist ").borders(Borders::LEFT).border_style(Style::default().fg(Color::DarkGray)))
+            .data(metrics.history.vram_usage.as_slice())
             .max(100)
-            .style(Style::default().fg(app.colors().primary));
-        frame.render_widget(sparkline, layout[1]);
-    } else {
-        let lines = vec![
-            Line::from(format!(" {}", gpu.name)),
-            usage_line("USAGE", gpu.utilization_pct.unwrap_or(0.0)),
-            usage_line(
-                "VRAM ",
-                percent(gpu.vram_used.unwrap_or(0), gpu.vram_total.unwrap_or(1)),
-            ),
-            Line::from(format!(
-                " {} / {}",
-                human_bytes(gpu.vram_used.unwrap_or(0)),
-                human_bytes(gpu.vram_total.unwrap_or(0))
-            )),
-            Line::from(format!(
-                " Temp: {}°C │ Power: {}W / {}W",
-                format_optional_decimal(gpu.temperature_c),
-                format_optional_decimal(gpu.power_draw_w),
-                format_optional_decimal(gpu.power_limit_w),
-            )),
-            Line::from(format!(" Pstate: {pstate} │ Clock: {clock} │ Fan: {fan}")),
-        ];
-        frame.render_widget(Paragraph::new(lines).block(block), area);
+            .style(Style::default().fg(Color::Green));
+        frame.render_widget(sparkline, split[1]);
     }
 }
 
-fn render_memory(frame: &mut Frame, area: Rect, app: &App) {
-    let metrics = &app.metrics;
+fn render_memory(frame: &mut Frame, area: Rect, metrics: &Metrics) {
     let memory = &metrics.memory;
     let ram_pct = percent(memory.used, memory.total);
     let swap_pct = percent(memory.swap_used, memory.swap_total);
-    
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .title(Span::styled(" Memory ", Style::default().fg(app.colors().primary)))
-        .border_style(Style::default().fg(app.colors().border));
+    let disk = &metrics.disk;
 
-    if app.config.sparklines_enabled {
+    let lines = vec![
+        usage_line("RAM", ram_pct),
+        Line::from(Span::styled(
+            format!(
+                " Available {} │ cache {}",
+                human_bytes(memory.available),
+                human_bytes(memory.cached)
+            ),
+            availability_style(percent(memory.available, memory.total)),
+        )),
+        usage_line("SWAP", swap_pct),
+        Line::from(format!(
+            " Swap I/O ↓{} ↑{}",
+            format_rate(memory.swap_in_bytes_per_sec),
+            format_rate(memory.swap_out_bytes_per_sec)
+        )),
+        Line::from(format!(
+            " Major faults {}/s │ dirty {}",
+            format_optional_rate(memory.major_faults_per_sec),
+            human_bytes(memory.dirty.saturating_add(memory.writeback))
+        )),
+        Line::from(format!(
+            " PSI mem {}/{}% │ I/O {}/{}%",
+            format_optional_decimal(memory.pressure_some_avg10),
+            format_optional_decimal(memory.pressure_full_avg10),
+            format_optional_decimal(memory.io_pressure_some_avg10),
+            format_optional_decimal(memory.io_pressure_full_avg10)
+        )),
+        Line::from(format!(
+            " Disk {} free │ {:.0}% used",
+            human_bytes(disk.available),
+            disk.used_pct
+        )),
+    ];
+
+    if metrics.history.ram_usage.is_empty() {
+        frame.render_widget(panel(" MEMORY / STORAGE ", lines), area);
+    } else {
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(Color::DarkGray))
+            .title(Span::styled(" MEMORY / STORAGE ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)));
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
-        let layout = Layout::default()
+        let split = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(70), Constraint::Percentage(30)])
             .split(inner);
+        
+        frame.render_widget(Paragraph::new(lines), split[0]);
 
-        let lines = vec![
-            usage_line("RAM", ram_pct),
-            Line::from(Span::styled(
-                format!(
-                    " Available {} │ cache {}",
-                    human_bytes(memory.available),
-                    human_bytes(memory.cached)
-                ),
-                availability_style(percent(memory.available, memory.total)),
-            )),
-            usage_line("SWAP", swap_pct),
-            Line::from(format!(
-                " Swap I/O ↓{} ↑{}",
-                format_rate(memory.swap_in_bytes_per_sec),
-                format_rate(memory.swap_out_bytes_per_sec)
-            )),
-            Line::from(format!(
-                " Major faults {}/s │ dirty {}",
-                format_optional_rate(memory.major_faults_per_sec),
-                human_bytes(memory.dirty.saturating_add(memory.writeback))
-            )),
-            Line::from(format!(
-                " PSI mem {}/{}% │ I/O {}/{}%",
-                format_optional_decimal(memory.pressure_some_avg10),
-                format_optional_decimal(memory.pressure_full_avg10),
-                format_optional_decimal(memory.io_pressure_some_avg10),
-                format_optional_decimal(memory.io_pressure_full_avg10)
-            )),
-        ];
-        frame.render_widget(Paragraph::new(lines), layout[0]);
-
-        let history: Vec<u64> = metrics.system.memory_history.iter().copied().collect();
-        let sparkline = Sparkline::default()
-            .data(&history)
+        let sparkline = ratatui::widgets::Sparkline::default()
+            .block(Block::default().title(" RAM Hist ").borders(Borders::LEFT).border_style(Style::default().fg(Color::DarkGray)))
+            .data(metrics.history.ram_usage.as_slice())
             .max(100)
-            .style(Style::default().fg(app.colors().primary));
-        frame.render_widget(sparkline, layout[1]);
-    } else {
-        let lines = vec![
-            usage_line("RAM", ram_pct),
-            Line::from(Span::styled(
-                format!(
-                    " Available {} │ cache {}",
-                    human_bytes(memory.available),
-                    human_bytes(memory.cached)
-                ),
-                availability_style(percent(memory.available, memory.total)),
-            )),
-            usage_line("SWAP", swap_pct),
-            Line::from(format!(
-                " Swap I/O ↓{} ↑{}",
-                format_rate(memory.swap_in_bytes_per_sec),
-                format_rate(memory.swap_out_bytes_per_sec)
-            )),
-            Line::from(format!(
-                " Major faults {}/s │ dirty {}",
-                format_optional_rate(memory.major_faults_per_sec),
-                human_bytes(memory.dirty.saturating_add(memory.writeback))
-            )),
-            Line::from(format!(
-                " PSI mem {}/{}% │ I/O {}/{}%",
-                format_optional_decimal(memory.pressure_some_avg10),
-                format_optional_decimal(memory.pressure_full_avg10),
-                format_optional_decimal(memory.io_pressure_some_avg10),
-                format_optional_decimal(memory.io_pressure_full_avg10)
-            )),
-        ];
-        frame.render_widget(Paragraph::new(lines).block(block), area);
+            .style(Style::default().fg(Color::LightYellow));
+        frame.render_widget(sparkline, split[1]);
     }
 }
 
@@ -2329,15 +2299,14 @@ fn render_insights(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn render_logs(frame: &mut Frame, area: Rect, app: &App) {
-    let inner_height = area.height.saturating_sub(2) as usize;
-    
-    let filtered_logs: Vec<_> = if let Some(query) = &app.search_input {
-        let q = query.to_lowercase();
-        app.logs.iter().filter(|e| e.text.to_lowercase().contains(&q)).collect()
+    let search_query = app.search_input.as_ref().filter(|s| !s.is_empty()).map(|s| s.to_lowercase());
+    let filtered_logs = if let Some(ref q) = search_query {
+        app.logs.iter().filter(|l| l.text.to_lowercase().contains(q)).collect::<Vec<_>>()
     } else {
-        app.logs.iter().collect()
+        app.logs.iter().collect::<Vec<_>>()
     };
 
+    let inner_height = area.height.saturating_sub(2) as usize;
     let end = filtered_logs.len().saturating_sub(app.log_offset);
     let start = end.saturating_sub(inner_height);
 
@@ -2422,11 +2391,18 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
             Span::raw(input.clone()),
             Span::styled("█", Style::default().fg(Color::Gray)),
         ])
-    } else if let Some(search) = &app.search_input {
+    } else if app.search_mode {
+        let input = app.search_input.as_deref().unwrap_or("");
         Line::from(vec![
-            Span::styled("/", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-            Span::raw(search.clone()),
+            Span::styled("/", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
+            Span::raw(input.to_owned()),
             Span::styled("█", Style::default().fg(Color::Gray)),
+        ])
+    } else if let Some(input) = &app.search_input {
+        Line::from(vec![
+            Span::styled("Search: ", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
+            Span::raw(input.clone()),
+            Span::styled("  (Press Esc to clear)", Style::default().fg(Color::DarkGray)),
         ])
     } else {
         Line::from(vec![
@@ -2444,10 +2420,10 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
             Span::raw(" scroll  "),
             Span::styled("c", Style::default().fg(Color::Cyan)),
             Span::raw(" clear  "),
+            Span::styled("/", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
+            Span::raw(" search  "),
             Span::styled(":", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::raw(" cmd  "),
-            Span::styled("/", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-            Span::raw(" search"),
+            Span::raw(" command"),
         ])
     };
     frame.render_widget(Paragraph::new(line), area);
@@ -2826,8 +2802,6 @@ fn extract_generation_settings(prompt: &Value, snapshot: &mut GenerationSnapshot
                     "model_name",
                     "diffusion_model_name",
                     "model_path",
-                    "unet_name",
-                    "gguf_name",
                 ],
             );
         }
@@ -3109,8 +3083,6 @@ fn collect_gpu(index: u32) -> GpuMetrics {
 
     GpuMetrics {
         available: true,
-        gpu_history: std::collections::VecDeque::new(),
-        vram_history: std::collections::VecDeque::new(),
         name: fields[0].to_owned(),
         temperature_c: parse_optional_f64(fields[1]),
         utilization_pct: parse_optional_f64(fields[2]),
