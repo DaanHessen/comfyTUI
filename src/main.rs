@@ -11,7 +11,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph},
+    widgets::{Block, Borders, BorderType, Paragraph},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -21,13 +21,13 @@ use std::{
     io::{self, Read, Stdout, Write},
     net::{TcpStream, ToSocketAddrs},
     path::{Path, PathBuf},
-    process::{Child, Command, ExitStatus, Stdio},
+    process::{Child, Command, Stdio},
     sync::mpsc::{self, Receiver, Sender},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-const APP_NAME: &str = "ComfyWise";
+const APP_NAME: &str = "ComfyTUI";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -158,7 +158,6 @@ struct CpuMetrics {
     load_1: Option<f64>,
     load_5: Option<f64>,
     load_15: Option<f64>,
-    platform_profile: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -425,7 +424,6 @@ impl MetricsCollector {
             load_1,
             load_5,
             load_15,
-            platform_profile: read_trimmed("/sys/firmware/acpi/platform_profile"),
         }
     }
 }
@@ -450,6 +448,13 @@ struct App {
     last_metrics_refresh: Instant,
     launch_error: Option<String>,
     low_memory_samples: u32,
+    shutdown_deadline: Option<Instant>,
+    shutdown_step: u8,
+    quitting: bool,
+    restarting: bool,
+    command_input: Option<String>,
+    show_help: bool,
+    insights: Vec<String>,
 }
 
 impl App {
@@ -476,12 +481,19 @@ impl App {
             last_metrics_refresh: Instant::now() - Duration::from_secs(10),
             launch_error: None,
             low_memory_samples: 0,
+            shutdown_deadline: None,
+            shutdown_step: 0,
+            quitting: false,
+            restarting: false,
+            command_input: None,
+            show_help: false,
+            insights: Vec::new(),
         }
     }
 
     fn launch(&mut self) -> Result<()> {
         if self.child.is_some() {
-            bail!("ComfyUI is already running under ComfyWise");
+            bail!("ComfyUI is already running under ComfyTUI");
         }
 
         self.run_number = self.run_number.saturating_add(1);
@@ -490,7 +502,7 @@ impl App {
             .unwrap_or_default()
             .as_millis();
         let unit_base = format!(
-            "comfywise-{}-{}-{epoch_ms}",
+            "comfytui-{}-{}-{epoch_ms}",
             std::process::id(),
             self.run_number
         );
@@ -541,17 +553,15 @@ impl App {
 
     fn restart(&mut self) {
         self.push_system("Restart requested".into());
-        self.stop_gracefully(Duration::from_secs(5));
-        thread::sleep(Duration::from_millis(250));
-        if let Err(error) = self.launch() {
-            let message = format!("Restart failed: {error:#}");
-            self.launch_error = Some(message.clone());
-            self.push_warning(message);
-            self.status = "Launch failed".into();
-        }
+        self.restarting = true;
+        self.begin_stop(Duration::from_secs(5));
     }
 
-    fn stop_gracefully(&mut self, timeout: Duration) {
+    fn begin_stop(&mut self, timeout: Duration) {
+        if self.status == "Stopping" {
+            return;
+        }
+
         let Some(unit) = self.scope_unit.clone() else {
             self.status = "Stopped".into();
             return;
@@ -567,29 +577,41 @@ impl App {
             &unit,
         ]);
 
-        let deadline = Instant::now() + timeout;
-        while Instant::now() < deadline {
-            self.drain_logs();
-            if !scope_is_active(&unit) {
-                self.finish_stopped();
-                return;
-            }
-            thread::sleep(Duration::from_millis(100));
+        self.shutdown_deadline = Some(Instant::now() + timeout);
+        self.shutdown_step = 1;
+    }
+
+    fn poll_shutdown(&mut self) {
+        if self.status != "Stopping" {
+            return;
         }
 
-        self.push_warning(format!("{unit} did not stop after SIGINT; asking systemd to stop it"));
-        let _ = systemctl(&["--user", "stop", &unit]);
-        let second_deadline = Instant::now() + Duration::from_secs(2);
-        while Instant::now() < second_deadline {
-            if !scope_is_active(&unit) {
-                self.finish_stopped();
-                return;
-            }
-            thread::sleep(Duration::from_millis(100));
+        let Some(unit) = self.scope_unit.clone() else {
+            self.finish_stopped();
+            return;
+        };
+
+        if !scope_is_active(&unit) {
+            self.finish_stopped();
+            return;
         }
 
-        self.push_warning(format!("{unit} still active; forcing SIGKILL"));
-        self.force_stop();
+        let deadline = match self.shutdown_deadline {
+            Some(d) => d,
+            None => return,
+        };
+
+        if Instant::now() >= deadline {
+            if self.shutdown_step == 1 {
+                self.push_warning(format!("{unit} did not stop after SIGINT; asking systemd to stop it"));
+                let _ = systemctl(&["--user", "stop", &unit]);
+                self.shutdown_step = 2;
+                self.shutdown_deadline = Some(Instant::now() + Duration::from_secs(2));
+            } else if self.shutdown_step == 2 {
+                self.push_warning(format!("{unit} still active; forcing SIGKILL"));
+                self.force_stop();
+            }
+        }
     }
 
     fn force_stop(&mut self) {
@@ -618,46 +640,58 @@ impl App {
         self.child = None;
         self.scope_unit = None;
         self.status = "Stopped".into();
+        self.shutdown_deadline = None;
+        self.shutdown_step = 0;
     }
 
     fn check_child(&mut self) {
-        let result = match self.child.as_mut() {
-            Some(child) => child.try_wait(),
-            None => return,
-        };
-
-        match result {
-            Ok(Some(status)) => self.handle_exit(status),
-            Ok(None) => {
-                if self.status == "Starting" && self.scope_unit.as_deref().is_some_and(scope_is_active) {
-                    self.status = "Running".into();
+        if self.status == "Stopped" {
+            return;
+        }
+        if let Some(mut child) = self.child.take() {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    self.status = "Stopped".into();
+                    self.push_system(format!("ComfyUI exited with {status}"));
+                    self.scope_unit = None;
+                }
+                Ok(None) => {
+                    self.child = Some(child);
+                    if self.status == "Starting" && self.scope_unit.as_deref().is_some_and(scope_is_active) {
+                        self.status = "Running".into();
+                    }
+                }
+                Err(e) => {
+                    self.push_system(format!("Error waiting on ComfyUI: {e}"));
+                    self.status = "Stopped".into();
+                    self.scope_unit = None;
                 }
             }
-            Err(error) => {
-                self.push_warning(format!("Unable to check launcher process: {error}"));
-            }
         }
     }
 
-    fn handle_exit(&mut self, status: ExitStatus) {
-        self.child = None;
-        let code = status
-            .code()
-            .map_or_else(|| "signal".to_owned(), |value| value.to_string());
-        if status.success() {
-            self.status = "Exited".into();
-            self.push_system(format!("ComfyUI launcher exited successfully ({code})"));
-        } else {
-            self.status = "Failed".into();
-            self.push_warning(format!("ComfyUI launcher exited with status {code}"));
-        }
-    }
 
     fn drain_logs(&mut self) {
         while let Ok(event) = self.rx.try_recv() {
             if let Some(progress) = event.progress.clone() {
                 self.apply_generation_progress(progress);
             }
+            
+            let text_lower = event.text.to_lowercase();
+            if text_lower.contains("import failed") 
+                || text_lower.contains("exception:") 
+                || text_lower.contains("no module named") 
+                || text_lower.contains("traceback (most recent call last)")
+                || text_lower.contains("error:") {
+                let trimmed = event.text.trim().to_owned();
+                if trimmed.len() > 10 && !self.insights.contains(&trimmed) {
+                    self.insights.push(trimmed);
+                    if self.insights.len() > 50 {
+                        self.insights.remove(0);
+                    }
+                }
+            }
+
             self.logs.push_back(event);
             while self.logs.len() > self.max_log_lines {
                 self.logs.pop_front();
@@ -774,7 +808,7 @@ impl App {
                 human_bytes(floor)
             ));
             self.low_memory_samples = 0;
-            self.stop_gracefully(Duration::from_secs(3));
+            self.begin_stop(Duration::from_secs(3));
         }
     }
 
@@ -882,6 +916,95 @@ impl App {
             warnings.push(error.clone());
         }
         (!warnings.is_empty()).then(|| warnings.join(" | "))
+    }
+
+    fn handle_command(&mut self, cmd: &str) {
+        let cmd = cmd.trim();
+        if cmd.is_empty() {
+            return;
+        }
+        let parts: Vec<&str> = cmd.split_whitespace().collect();
+        match parts[0] {
+            "q" | "quit" => {
+                self.quitting = true;
+                self.begin_stop(Duration::from_secs(5));
+            }
+            "help" | "h" => {
+                self.show_help = true;
+            }
+            "w" | "write" => {
+                self.save_config();
+            }
+            "wq" => {
+                self.save_config();
+                self.quitting = true;
+                self.begin_stop(Duration::from_secs(5));
+            }
+            "set" => {
+                if parts.len() < 2 {
+                    self.push_warning("Usage: :set key=value".into());
+                    return;
+                }
+                let assignment = parts[1..].join(" ");
+                if let Some((key, value)) = assignment.split_once('=') {
+                    self.apply_setting(key.trim(), value.trim());
+                } else {
+                    self.push_warning(format!("Invalid setting format: {}", assignment));
+                }
+            }
+            _ => {
+                self.push_warning(format!("Unknown command: {}", parts[0]));
+            }
+        }
+    }
+
+    fn apply_setting(&mut self, key: &str, value: &str) {
+        let success = match key {
+            "memory_high" => {
+                self.config.memory_high = value.to_owned();
+                true
+            }
+            "memory_max" => {
+                self.config.memory_max = value.to_owned();
+                true
+            }
+            "memory_swap_max" => {
+                self.config.memory_swap_max = value.to_owned();
+                true
+            }
+            "auto_stop_on_low_memory" => {
+                if let Ok(b) = value.parse::<bool>() {
+                    self.config.auto_stop_on_low_memory = b;
+                    true
+                } else {
+                    self.push_warning("Invalid boolean for auto_stop_on_low_memory".into());
+                    false
+                }
+            }
+            _ => {
+                self.push_warning(format!("Unknown setting: {}", key));
+                false
+            }
+        };
+
+        if success {
+            self.push_system(format!("Setting updated: {} = {}", key, value));
+        }
+    }
+
+    fn save_config(&mut self) {
+        match toml::to_string_pretty(&self.config) {
+            Ok(serialized) => {
+                if let Err(e) = fs::write(&self.config_path, serialized) {
+                    self.push_warning(format!("Failed to save config: {}", e));
+                } else {
+                    self.push_system(format!("Config saved to {}", self.config_path.display()));
+                }
+            }
+            Err(e) => {
+                self.push_warning(format!("Failed to serialize config: {}", e));
+            }
+        }
     }
 }
 
@@ -996,7 +1119,14 @@ fn main() -> Result<()> {
     let result = run_ui(&mut session.terminal, &mut app);
 
     if app.child.is_some() || app.scope_unit.as_deref().is_some_and(scope_is_active) {
-        app.stop_gracefully(Duration::from_secs(5));
+        app.begin_stop(Duration::from_secs(5));
+        while app.status != "Stopped" {
+            app.drain_logs();
+            app.check_child();
+            app.poll_shutdown();
+            let _ = session.terminal.draw(|frame| render(frame, &app));
+            thread::sleep(Duration::from_millis(100));
+        }
     }
 
     result
@@ -1006,7 +1136,7 @@ fn main() -> Result<()> {
 fn print_help() {
     println!(
         "{APP_NAME} {VERSION}\n\n\
-Usage:\n  comfywise                 Launch ComfyUI and open the dashboard\n  comfywise --check         Validate paths, NVIDIA access, and cgroup support\n  comfywise --print-config  Print the active config path\n  comfywise --version       Print the version\n  comfywise --help          Show this help"
+Usage:\n  comfytui                 Launch ComfyUI and open the dashboard\n  comfytui --check         Validate paths, NVIDIA access, and cgroup support\n  comfytui --print-config  Print the active config path\n  comfytui --version       Print the version\n  comfytui --help          Show this help"
     );
 }
 
@@ -1032,7 +1162,7 @@ fn run_preflight_check() -> Result<()> {
         Err(error) => println!("[warn] nvidia-smi unavailable: {error}"),
     }
 
-    let unit = format!("comfywise-preflight-{}", std::process::id());
+    let unit = format!("comfytui-preflight-{}", std::process::id());
     let status = Command::new("systemd-run")
         .arg("--user")
         .arg("--scope")
@@ -1063,6 +1193,22 @@ fn run_ui(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> R
         app.drain_logs();
         app.check_child();
         app.refresh_metrics_if_due();
+        app.poll_shutdown();
+
+        if app.quitting && app.status == "Stopped" {
+            return Ok(());
+        }
+        
+        if app.restarting && app.status == "Stopped" {
+            app.restarting = false;
+            if let Err(error) = app.launch() {
+                let message = format!("Restart failed: {error:#}");
+                app.launch_error = Some(message.clone());
+                app.push_warning(message);
+                app.status = "Launch failed".into();
+            }
+        }
+
         terminal.draw(|frame| render(frame, app))?;
 
         if !event::poll(Duration::from_millis(100))? {
@@ -1072,6 +1218,34 @@ fn run_ui(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> R
             continue;
         };
         if key.kind != KeyEventKind::Press {
+            continue;
+        }
+
+        if app.show_help {
+            app.show_help = false;
+            continue;
+        }
+
+        if let Some(mut input) = app.command_input.take() {
+            match key.code {
+                KeyCode::Esc => {
+                    // Canceled
+                }
+                KeyCode::Enter => {
+                    app.handle_command(&input);
+                }
+                KeyCode::Backspace => {
+                    input.pop();
+                    app.command_input = Some(input);
+                }
+                KeyCode::Char(c) => {
+                    input.push(c);
+                    app.command_input = Some(input);
+                }
+                _ => {
+                    app.command_input = Some(input);
+                }
+            }
             continue;
         }
 
@@ -1085,13 +1259,13 @@ fn run_ui(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> R
                 modifiers: KeyModifiers::CONTROL,
                 ..
             } => {
-                app.stop_gracefully(Duration::from_secs(5));
-                return Ok(());
+                app.quitting = true;
+                app.begin_stop(Duration::from_secs(5));
             }
             KeyEvent {
                 code: KeyCode::Char('s'),
                 ..
-            } => app.stop_gracefully(Duration::from_secs(5)),
+            } => app.begin_stop(Duration::from_secs(5)),
             KeyEvent {
                 code: KeyCode::Char('k'),
                 ..
@@ -1104,6 +1278,10 @@ fn run_ui(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> R
                 code: KeyCode::Char('c'),
                 ..
             } => app.clear_logs(),
+            KeyEvent {
+                code: KeyCode::Char(':'),
+                ..
+            } => app.command_input = Some(String::new()),
             KeyEvent {
                 code: KeyCode::Char(' '),
                 ..
@@ -1167,14 +1345,102 @@ fn render(frame: &mut Frame, app: &App) {
 
     render_header(frame, rows[0], app);
 
-    let columns = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
-        .split(rows[1]);
+    if area.width < 120 {
+        let columns = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(rows[1]);
+        render_diagnostics(frame, columns[0], app);
+        if app.insights.is_empty() {
+            render_logs(frame, columns[1], app);
+        } else {
+            let log_split = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Percentage(25), Constraint::Percentage(75)])
+                .split(columns[1]);
+            render_insights(frame, log_split[0], app);
+            render_logs(frame, log_split[1], app);
+        }
+    } else {
+        let columns = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
+            .split(rows[1]);
+        render_diagnostics(frame, columns[0], app);
+        if app.insights.is_empty() {
+            render_logs(frame, columns[1], app);
+        } else {
+            let log_split = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Percentage(25), Constraint::Percentage(75)])
+                .split(columns[1]);
+            render_insights(frame, log_split[0], app);
+            render_logs(frame, log_split[1], app);
+        }
+    }
 
-    render_diagnostics(frame, columns[0], app);
-    render_logs(frame, columns[1], app);
-    render_footer(frame, rows[2]);
+    render_footer(frame, rows[2], app);
+
+    if app.show_help {
+        render_help_modal(frame, area);
+    }
+}
+
+fn render_help_modal(frame: &mut Frame, area: Rect) {
+    let help_text = vec![
+        Line::from(Span::styled("ComfyTUI Help", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))),
+        Line::from(""),
+        Line::from(Span::styled("Commands (press ':' to enter):", Style::default().add_modifier(Modifier::BOLD))),
+        Line::from("  :q, :quit                 Stop ComfyUI and exit ComfyTUI"),
+        Line::from("  :w, :write                Save the current config"),
+        Line::from("  :wq                       Save config and exit"),
+        Line::from("  :set key=value            Update a setting (e.g., :set memory_high=16G)"),
+        Line::from("  :help, :h                 Show this help menu"),
+        Line::from(""),
+        Line::from(Span::styled("Keybindings:", Style::default().add_modifier(Modifier::BOLD))),
+        Line::from("  q, Ctrl-C                 Quit"),
+        Line::from("  s                         Stop ComfyUI gracefully"),
+        Line::from("  k                         Force kill ComfyUI"),
+        Line::from("  r                         Restart ComfyUI"),
+        Line::from("  space                     Toggle log following"),
+        Line::from("  c                         Clear logs"),
+        Line::from("  Up/Down/PgUp/PgDn/Home    Scroll logs vertically"),
+        Line::from("  Left/Right                Scroll logs horizontally"),
+        Line::from(""),
+        Line::from(Span::styled("Press any key to close this help modal.", Style::default().fg(Color::DarkGray))),
+    ];
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(" Help ")
+        .style(Style::default().bg(Color::Black)); // Set background to black to overlay correctly
+
+    let paragraph = Paragraph::new(help_text).block(block);
+
+    // Calculate a centered rectangle
+    let vertical_center = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage(20),
+            Constraint::Length(22),
+            Constraint::Percentage(20),
+        ])
+        .split(area);
+
+    let horizontal_center = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(20),
+            Constraint::Min(70),
+            Constraint::Percentage(20),
+        ])
+        .split(vertical_center[1]);
+
+    use ratatui::widgets::Clear;
+    frame.render_widget(Clear, horizontal_center[1]);
+    frame.render_widget(paragraph, horizontal_center[1]);
 }
 
 fn render_header(frame: &mut Frame, area: Rect, app: &App) {
@@ -1185,6 +1451,15 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
         _ => Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
     };
 
+    let spinner = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    let spinner_frame = spinner[(SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() / 100) as usize % spinner.len()];
+    
+    let status_text = match app.status.as_str() {
+        "Starting" => format!("{} Starting", spinner_frame),
+        "Stopping" => format!("{} Stopping", spinner_frame),
+        other => other.to_owned(),
+    };
+
     let unit = app.scope_unit.as_deref().unwrap_or("no active scope");
     let mut lines = vec![Line::from(vec![
         Span::styled(
@@ -1192,7 +1467,7 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
             Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
         ),
         Span::raw("│ "),
-        Span::styled(app.status.as_str(), status_style),
+        Span::styled(status_text, status_style),
         Span::raw(format!(" │ {unit}")),
     ])];
 
@@ -1209,7 +1484,13 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
     }
 
     frame.render_widget(
-        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" Session ")),
+        Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(Color::DarkGray))
+                .title(" Session ")
+        ),
         area,
     );
 }
@@ -1376,7 +1657,6 @@ fn render_cpu(frame: &mut Frame, area: Rect, metrics: &Metrics) {
         (Some(a), Some(b), Some(c)) => format!("{a:.2} / {b:.2} / {c:.2}"),
         _ => "N/A".to_owned(),
     };
-    let profile = cpu.platform_profile.as_deref().unwrap_or("unknown");
     let ac: String = metrics.power.ac_online.map_or_else(
         || "AC ?".to_owned(),
         |online| {
@@ -1395,7 +1675,6 @@ fn render_cpu(frame: &mut Frame, area: Rect, metrics: &Metrics) {
         usage_line("CPU", cpu.usage_pct),
         Line::from(format!(" Temp {temp:<8} │ Avg clock {frequency}")),
         Line::from(format!(" Load 1/5/15: {load}")),
-        Line::from(format!(" ASUS profile: {profile}")),
         Line::from(format!(" Power: {ac}{battery}")),
     ];
     frame.render_widget(panel(" CPU / SYSTEM ", lines), area);
@@ -1551,9 +1830,15 @@ fn render_guard(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(panel(" COMFYUI RESOURCE GUARD ", lines), area);
 }
 
+fn render_insights(frame: &mut Frame, area: Rect, app: &App) {
+    let lines = app.insights.iter().map(|msg| {
+        Line::from(Span::styled(format!("• {}", msg), Style::default().fg(Color::Yellow)))
+    }).collect::<Vec<_>>();
+    frame.render_widget(panel(" INSIGHTS / ISSUES ", lines), area);
+}
+
 fn render_logs(frame: &mut Frame, area: Rect, app: &App) {
     let inner_height = area.height.saturating_sub(2) as usize;
-    let inner_width = area.width.saturating_sub(2) as usize;
     let end = app.logs.len().saturating_sub(app.log_offset);
     let start = end.saturating_sub(inner_height);
 
@@ -1566,18 +1851,50 @@ fn render_logs(frame: &mut Frame, area: Rect, app: &App) {
             let prefix = match event.kind {
                 StreamKind::Stdout => "",
                 StreamKind::Stderr => "[ERR] ",
-                StreamKind::System => "[CW]  ",
+                StreamKind::System => "[CT]  ",
                 StreamKind::Warning => "[WARN] ",
             };
             let complete = format!("{prefix}{}", event.text);
-            let visible = horizontal_slice(&complete, app.horizontal_offset, inner_width);
-            let style = match event.kind {
+            let base_style = match event.kind {
                 StreamKind::Stdout => Style::default(),
-                StreamKind::Stderr => Style::default().fg(Color::Yellow),
+                StreamKind::Stderr => Style::default().fg(Color::LightYellow),
                 StreamKind::System => Style::default().fg(Color::Cyan),
                 StreamKind::Warning => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
             };
-            Line::from(Span::styled(visible, style))
+            
+            let mut spans = Vec::new();
+            let mut current = String::new();
+            for c in complete.chars() {
+                if c.is_whitespace() || c == '[' || c == ']' || c == '(' || c == ')' || c == ':' || c == ',' {
+                    if !current.is_empty() {
+                        let style = match current.as_str() {
+                            "Error" | "Failed" | "FAILED" | "ERROR" | "Exception" => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                            "Warning" | "WARNING" | "WARN" => Style::default().fg(Color::LightYellow),
+                            "Info" | "INFO" | "ok" | "OK" => Style::default().fg(Color::Green),
+                            s if s.parse::<f64>().is_ok() => Style::default().fg(Color::LightCyan),
+                            s if s.starts_with('/') || s.starts_with("C:\\") || s.starts_with("http://") || s.starts_with("https://") => Style::default().fg(Color::LightBlue),
+                            _ => base_style,
+                        };
+                        spans.push(Span::styled(current.clone(), style));
+                        current.clear();
+                    }
+                    spans.push(Span::styled(c.to_string(), base_style));
+                } else {
+                    current.push(c);
+                }
+            }
+            if !current.is_empty() {
+                let style = match current.as_str() {
+                    "Error" | "Failed" | "FAILED" | "ERROR" | "Exception" => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                    "Warning" | "WARNING" | "WARN" => Style::default().fg(Color::LightYellow),
+                    "Info" | "INFO" | "ok" | "OK" => Style::default().fg(Color::Green),
+                    s if s.parse::<f64>().is_ok() => Style::default().fg(Color::LightCyan),
+                    s if s.starts_with('/') || s.starts_with("C:\\") || s.starts_with("http://") || s.starts_with("https://") => Style::default().fg(Color::LightBlue),
+                    _ => base_style,
+                };
+                spans.push(Span::styled(current, style));
+            }
+            Line::from(spans)
         })
         .collect::<Vec<_>>();
 
@@ -1587,33 +1904,57 @@ fn render_logs(frame: &mut Frame, area: Rect, app: &App) {
         app.log_offset, app.horizontal_offset
     );
     frame.render_widget(
-        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(title)),
+        Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(Color::DarkGray))
+                    .title(Span::styled(title, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)))
+            )
+            .scroll((0, app.horizontal_offset as u16)),
         area,
     );
 }
 
-fn render_footer(frame: &mut Frame, area: Rect) {
-    let line = Line::from(vec![
-        Span::styled(" q", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-        Span::raw(" quit  "),
-        Span::styled("s", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-        Span::raw(" stop  "),
-        Span::styled("r", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-        Span::raw(" restart  "),
-        Span::styled("k", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
-        Span::raw(" force-kill  "),
-        Span::styled("space", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-        Span::raw(" follow  "),
-        Span::styled("↑↓ PgUp/PgDn ←→", Style::default().fg(Color::Cyan)),
-        Span::raw(" scroll  "),
-        Span::styled("c", Style::default().fg(Color::Cyan)),
-        Span::raw(" clear"),
-    ]);
+fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
+    let line = if let Some(input) = &app.command_input {
+        Line::from(vec![
+            Span::styled(":", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::raw(input.clone()),
+            Span::styled("█", Style::default().fg(Color::Gray)),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled(" q", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::raw(" quit  "),
+            Span::styled("s", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::raw(" stop  "),
+            Span::styled("r", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::raw(" restart  "),
+            Span::styled("k", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+            Span::raw(" force-kill  "),
+            Span::styled("space", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::raw(" follow  "),
+            Span::styled("↑↓ PgUp/PgDn ←→", Style::default().fg(Color::Cyan)),
+            Span::raw(" scroll  "),
+            Span::styled("c", Style::default().fg(Color::Cyan)),
+            Span::raw(" clear  "),
+            Span::styled(":", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::raw(" command"),
+        ])
+    };
     frame.render_widget(Paragraph::new(line), area);
 }
 
 fn panel(title: &'static str, lines: Vec<Line<'static>>) -> Paragraph<'static> {
-    Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(title))
+    Paragraph::new(lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(Color::DarkGray))
+            .title(Span::styled(title, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)))
+    )
 }
 
 fn usage_line(label: &str, pct: f64) -> Line<'static> {
@@ -1968,7 +2309,8 @@ fn extract_generation_settings(prompt: &Value, snapshot: &mut GenerationSnapshot
         if snapshot.model.is_none()
             && (class_lower.contains("loader")
                 || class_lower.contains("checkpoint")
-                || class_lower.contains("unet"))
+                || class_lower.contains("unet")
+                || class_lower.contains("gguf"))
         {
             snapshot.model = json_input_string(
                 inputs,
@@ -2486,11 +2828,11 @@ fn read_trimmed(path: impl AsRef<Path>) -> Option<String> {
 
 fn config_path() -> Result<PathBuf> {
     if let Some(path) = env::var_os("XDG_CONFIG_HOME") {
-        return Ok(PathBuf::from(path).join("comfywise/config.toml"));
+        return Ok(PathBuf::from(path).join("comfytui/config.toml"));
     }
     Ok(home_dir()
         .ok_or_else(|| anyhow!("HOME is not set"))?
-        .join(".config/comfywise/config.toml"))
+        .join(".config/comfytui/config.toml"))
 }
 
 fn home_dir() -> Option<PathBuf> {
@@ -2526,10 +2868,6 @@ fn percent(used: u64, total: u64) -> f64 {
 
 fn gib(value: u64) -> u64 {
     value.saturating_mul(1024 * 1024 * 1024)
-}
-
-fn horizontal_slice(text: &str, offset: usize, width: usize) -> String {
-    text.chars().skip(offset).take(width).collect()
 }
 
 fn strip_ansi(input: &str) -> String {
@@ -2577,10 +2915,7 @@ mod tests {
         assert_eq!(parse_systemd_bytes("[not set]"), None);
     }
 
-    #[test]
-    fn slices_unicode_by_characters() {
-        assert_eq!(horizontal_slice("ab█cd", 2, 2), "█c");
-    }
+
 
 
     #[test]

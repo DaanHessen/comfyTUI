@@ -3,8 +3,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 BIN_DIR="${HOME}/.local/bin"
-BIN_PATH="${BIN_DIR}/comfywise"
-CONFIG_DIR="${XDG_CONFIG_HOME:-${HOME}/.config}/comfywise"
+BIN_PATH="${BIN_DIR}/comfytui"
+CONFIG_DIR="${XDG_CONFIG_HOME:-${HOME}/.config}/comfytui"
 CONFIG_PATH="${CONFIG_DIR}/config.toml"
 PATH_WAS_ADDED=0
 
@@ -18,22 +18,22 @@ command -v cargo >/dev/null 2>&1 || fail \
 command -v systemd-run >/dev/null 2>&1 || fail "systemd-run is required"
 command -v systemctl >/dev/null 2>&1 || fail "systemctl is required"
 
-printf 'Compiling and running ComfyWise unit tests...\n'
+printf 'Compiling and running ComfyTUI unit tests...\n'
 cd "$SCRIPT_DIR"
 cargo test --release
 
-printf 'Building ComfyWise in release mode...\n'
+printf 'Building ComfyTUI in release mode...\n'
 cargo build --release
 
 install -d "$BIN_DIR"
-install -m 0755 "$SCRIPT_DIR/target/release/comfywise" "$BIN_PATH"
+install -m 0755 "$SCRIPT_DIR/target/release/comfytui" "$BIN_PATH"
 
 install -d "$CONFIG_DIR"
 if [[ ! -e "$CONFIG_PATH" ]]; then
     sed \
         -e "s#/home/daanh#${HOME//\#/\\#}#g" \
         -e "s#/media/daanh#/media/${USER}#g" \
-        "$SCRIPT_DIR/comfywise.example.toml" > "$CONFIG_PATH"
+        "$SCRIPT_DIR/comfytui.example.toml" > "$CONFIG_PATH"
     printf 'Created %s\n' "$CONFIG_PATH"
 else
     # v0.1.1 migration: the original generated config disabled sampler previews.
@@ -85,4 +85,4 @@ printf '\nDone.\n'
 if (( PATH_WAS_ADDED )); then
     printf 'Open a new terminal, or run: source ~/.zshrc\n'
 fi
-printf 'Start it with: comfywise\n'
+printf 'Start it with: comfytui\n'

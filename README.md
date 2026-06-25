@@ -1,4 +1,4 @@
-# ComfyWise
+# ComfyTUI
 
 A Linux/Arch-focused Rust TUI that launches ComfyUI inside a protected systemd user scope, shows live ComfyUI logs, and keeps generation plus system diagnostics visible in one terminal.
 
@@ -56,28 +56,28 @@ Extract/open this project and run:
 ./install.sh
 ```
 
-The installer runs the unit tests, builds an optimized release binary, installs it at `~/.local/bin/comfywise`, preserves or creates the config, and runs preflight checks.
+The installer runs the unit tests, builds an optimized release binary, installs it at `~/.local/bin/comfytui`, preserves or creates the config, and runs preflight checks.
 
 Then start ComfyUI with:
 
 ```bash
-comfywise
+comfytui
 ```
 
 ## Commands
 
 ```text
-comfywise                 Start ComfyUI and open the dashboard
-comfywise --check         Validate paths, NVIDIA access and cgroup support
-comfywise --print-config  Print the active config path
-comfywise --version       Print the version
-comfywise --help          Show usage
+comfytui                 Start ComfyUI and open the dashboard
+comfytui --check         Validate paths, NVIDIA access and cgroup support
+comfytui --print-config  Print the active config path
+comfytui --version       Print the version
+comfytui --help          Show usage
 ```
 
 ## Controls
 
 ```text
-q / Ctrl-C       Stop ComfyUI and close ComfyWise
+q / Ctrl-C       Stop ComfyUI and close ComfyTUI
 s                Stop ComfyUI but keep the dashboard open
 r                Stop and restart ComfyUI in a fresh scope
 k                Force-kill the complete ComfyUI scope
@@ -94,7 +94,7 @@ c                Clear the in-memory log buffer
 The active file is:
 
 ```text
-~/.config/comfywise/config.toml
+~/.config/comfytui/config.toml
 ```
 
 Default content:
@@ -120,7 +120,7 @@ The Python virtual environment does not need to be activated. Calling the interp
 
 ### API address
 
-The generation panel polls `http://api_host:api_port/queue`. Keep these values aligned with any `--listen` or `--port` arguments you add to `comfy_args`. The API is only read; ComfyWise does not submit, modify, or cancel prompts through it.
+The generation panel polls `http://api_host:api_port/queue`. Keep these values aligned with any `--listen` or `--port` arguments you add to `comfy_args`. The API is only read; ComfyTUI does not submit, modify, or cancel prompts through it.
 
 ### Changing the memory ceiling
 
@@ -141,7 +141,7 @@ The watchdog uses Linux `MemAvailable`, not merely unused RAM. With the defaults
 
 ## Data sources
 
-ComfyWise reads:
+ComfyTUI reads:
 
 - ComfyUI `/queue` plus ComfyUI stdout/stderr progress output
 - `/proc/stat`, `/proc/meminfo`, `/proc/vmstat`, `/proc/loadavg`

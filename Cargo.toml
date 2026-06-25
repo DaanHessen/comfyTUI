@@ -1,5 +1,5 @@
 [package]
-name = "comfywise"
+name = "comfytui"
 version = "0.2.0"
 edition = "2024"
 description = "A guarded ComfyUI launcher with live Linux/NVIDIA diagnostics"

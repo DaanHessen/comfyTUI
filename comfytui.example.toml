@@ -1,5 +1,5 @@
-# ComfyWise configuration
-# Installed by default as ~/.config/comfywise/config.toml
+# ComfyTUI configuration
+# Installed by default as ~/.config/comfytui/config.toml
 
 comfy_dir = "/media/daanh/Shared/comfy/ComfyUI"
 python = "/home/daanh/.pyenv/versions/3.13.7/envs/venv13/bin/python"
@@ -28,7 +28,7 @@ api_host = "127.0.0.1"
 api_port = 8188
 
 # Last-resort global safety net. If total system MemAvailable stays below
-# this floor for N consecutive refreshes, ComfyWise stops ComfyUI.
+# this floor for N consecutive refreshes, ComfyTUI stops ComfyUI.
 auto_stop_on_low_memory = true
 emergency_ram_floor_mib = 2048
 emergency_consecutive_samples = 3
