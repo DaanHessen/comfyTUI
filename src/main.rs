@@ -979,9 +979,10 @@ impl App {
             new_metrics.system.cpu_history = self.metrics.system.cpu_history.clone();
             new_metrics.system.memory_history = self.metrics.system.memory_history.clone();
             if new_metrics.system.cpu_history.len() >= 60 { new_metrics.system.cpu_history.pop_front(); }
-            new_metrics.system.cpu_history.push_back(new_metrics.system.cpu_usage as u64);
+            new_metrics.system.cpu_history.push_back(new_metrics.cpu.usage_pct as u64);
             if new_metrics.system.memory_history.len() >= 60 { new_metrics.system.memory_history.pop_front(); }
-            new_metrics.system.memory_history.push_back((new_metrics.system.memory_used as f64 / new_metrics.system.memory_total as f64 * 100.0) as u64);
+            let mem_pct = if new_metrics.memory.total > 0 { (new_metrics.memory.used as f64 / new_metrics.memory.total as f64 * 100.0) as u64 } else { 0 };
+            new_metrics.system.memory_history.push_back(mem_pct);
             
             // Note: Assuming GpuMetrics fields gpu_history/vram_history exist as per requirements
             if new_metrics.gpu.available {
@@ -1431,10 +1432,21 @@ fn run_ui(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> R
 
         terminal.draw(|frame| render(frame, app))?;
 
-        if !event::poll(Duration::from_millis(100))? {
-            continue;
+        match event::poll(Duration::from_millis(100)) {
+            Ok(true) => {}
+            Ok(false) => continue,
+            Err(_) => {
+                std::thread::sleep(Duration::from_millis(100));
+                continue;
+            }
         }
-        let Event::Key(key) = event::read()? else {
+        let Event::Key(key) = (match event::read() {
+            Ok(e) => e,
+            Err(_) => {
+                std::thread::sleep(Duration::from_millis(100));
+                continue;
+            }
+        }) else {
             continue;
         };
         if key.kind != KeyEventKind::Press {
@@ -1510,18 +1522,17 @@ fn run_ui(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> R
                 match key.code {
                     KeyCode::Up => { app.settings_index = app.settings_index.saturating_sub(1); }
                     KeyCode::Down => { app.settings_index = (app.settings_index + 1).min(9); }
-                    KeyCode::Enter => {
-                        app.settings_edit_mode = true;
-                        app.settings_input = app.get_setting_string(app.settings_index);
-                    }
-                    KeyCode::Char(' ') => {
+                    KeyCode::Enter | KeyCode::Char(' ') | KeyCode::Left | KeyCode::Right => {
                         if app.settings_index == 5 || app.settings_index == 8 || app.settings_index == 9 {
                             app.toggle_setting(app.settings_index);
+                        } else if key.code == KeyCode::Enter {
+                            app.settings_edit_mode = true;
+                            app.settings_input = app.get_setting_string(app.settings_index);
                         }
                     }
                     _ => {}
                 }
-                if matches!(key.code, KeyCode::Up | KeyCode::Down | KeyCode::Enter) {
+                if matches!(key.code, KeyCode::Up | KeyCode::Down | KeyCode::Enter | KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')) {
                     continue;
                 }
             }
@@ -1662,12 +1673,21 @@ fn render(frame: &mut Frame, app: &App) {
 }
 
 fn render_dashboard(frame: &mut Frame, area: Rect, app: &App) {
-    if area.width < 120 {
+    let dash_rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(8), Constraint::Min(0)])
+        .split(area);
+
+    render_generation(frame, dash_rows[0], app);
+
+    let bottom_area = dash_rows[1];
+
+    if bottom_area.width < 120 {
         let columns = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-            .split(area);
-        render_diagnostics(frame, columns[0], app);
+            .split(bottom_area);
+        render_hardware(frame, columns[0], app);
         if app.insights.is_empty() {
             render_logs(frame, columns[1], app);
         } else {
@@ -1681,9 +1701,9 @@ fn render_dashboard(frame: &mut Frame, area: Rect, app: &App) {
     } else {
         let columns = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
-            .split(area);
-        render_diagnostics(frame, columns[0], app);
+            .constraints([Constraint::Percentage(35), Constraint::Percentage(65)])
+            .split(bottom_area);
+        render_hardware(frame, columns[0], app);
         if app.insights.is_empty() {
             render_logs(frame, columns[1], app);
         } else {
@@ -1883,23 +1903,22 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(tabs, layout[1]);
 }
 
-fn render_diagnostics(frame: &mut Frame, area: Rect, app: &App) {
+fn render_hardware(frame: &mut Frame, area: Rect, app: &App) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(12),
             Constraint::Length(8),
-            Constraint::Length(9),
-            Constraint::Length(7),
-            Constraint::Min(8),
+            Constraint::Length(8),
+            Constraint::Length(5),
+            Constraint::Length(8),
+            Constraint::Min(0),
         ])
         .split(area);
 
-    render_generation(frame, rows[0], app);
-    render_gpu(frame, rows[1], app);
-    render_memory(frame, rows[2], app);
-    render_cpu(frame, rows[3], app);
-    render_guard(frame, rows[4], app);
+    render_gpu(frame, rows[0], app);
+    render_memory(frame, rows[1], app);
+    render_cpu(frame, rows[2], app);
+    render_guard(frame, rows[3], app);
 }
 
 fn render_generation(frame: &mut Frame, area: Rect, app: &App) {
@@ -1989,7 +2008,7 @@ fn render_generation(frame: &mut Frame, area: Rect, app: &App) {
         generation.loras.join(", ")
     };
 
-    let mut lines = vec![
+    let mut left_lines = vec![
         Line::from(vec![
             Span::raw(" "),
             Span::styled(state, generation_state_style(state)),
@@ -2003,34 +2022,75 @@ fn render_generation(frame: &mut Frame, area: Rect, app: &App) {
             Span::styled(mini_bar(progress_pct, 18), Style::default().fg(Color::Cyan)),
             Span::raw(format!(" {progress_pct:5.1}% │ step {step_text}")),
         ]),
-        Line::from(format!(" Time {elapsed} │ ETA {eta}")),
-        Line::from(format!(" Sampler {sampler} │ {scheduler}")),
-        Line::from(format!(" CFG {cfg} │ den {denoise} │ g {guidance} │ shift {shift}")),
-        Line::from(format!(" Seed {}", truncate_middle(seed, available_width.saturating_sub(7)))),
-        Line::from(format!(" Image {resolution} │ batch {batch} │ nodes {nodes}/{output_nodes}")),
-        Line::from(format!(" Model {}", truncate_middle(model, available_width.saturating_sub(8)))),
-        Line::from(format!(" Encoder {}", truncate_middle(encoder, available_width.saturating_sub(10)))),
-        Line::from(format!(
-            " VAE {} │ LoRA {}",
-            truncate_middle(vae, (available_width / 3).saturating_sub(5)),
-            truncate_middle(&loras, (available_width - available_width / 3).saturating_sub(10))
-        )),
+        Line::from(vec![
+            Span::raw(" Time "), Span::styled(elapsed, Style::default().fg(app.colors().primary)),
+            Span::raw(" │ ETA "), Span::styled(eta, Style::default().fg(app.colors().primary)),
+        ]),
+        Line::from(vec![
+            Span::raw(" Sampler "), Span::styled(sampler.to_owned(), Style::default().fg(app.colors().primary)),
+            Span::raw(" │ "), Span::styled(scheduler.to_owned(), Style::default().fg(app.colors().primary)),
+        ]),
+        Line::from(vec![
+            Span::raw(" CFG "), Span::styled(cfg, Style::default().fg(app.colors().primary)),
+            Span::raw(" │ den "), Span::styled(denoise, Style::default().fg(app.colors().primary)),
+            Span::raw(" │ guidance "), Span::styled(guidance, Style::default().fg(app.colors().primary)),
+            Span::raw(" │ shift "), Span::styled(shift, Style::default().fg(app.colors().primary)),
+        ]),
+        Line::from(vec![
+            Span::raw(" Seed "), Span::styled(truncate_middle(seed, available_width.saturating_sub(7)), Style::default().fg(app.colors().primary)),
+        ]),
+    ];
+
+    let mut right_lines = vec![
+        Line::from(vec![
+            Span::raw(" Image "), Span::styled(resolution, Style::default().fg(app.colors().primary)),
+            Span::raw(" │ batch "), Span::styled(batch.to_string(), Style::default().fg(app.colors().primary)),
+            Span::raw(" │ nodes "), Span::styled(format!("{nodes}/{output_nodes}"), Style::default().fg(app.colors().primary)),
+        ]),
+        Line::from(vec![
+            Span::raw(" Model "), Span::styled(truncate_middle(model, available_width.saturating_sub(8)), Style::default().fg(app.colors().primary)),
+        ]),
+        Line::from(vec![
+            Span::raw(" Encoder "), Span::styled(truncate_middle(encoder, available_width.saturating_sub(10)), Style::default().fg(app.colors().primary)),
+        ]),
+        Line::from(vec![
+            Span::raw(" VAE "), Span::styled(truncate_middle(vae, (available_width / 3).saturating_sub(5)), Style::default().fg(app.colors().primary)),
+            Span::raw(" │ LoRA "), Span::styled(truncate_middle(&loras, (available_width - available_width / 3).saturating_sub(10)), Style::default().fg(app.colors().primary)),
+        ]),
     ];
 
     if !generation.api_connected {
         if let Some(error) = &generation.api_error {
-            lines[9] = Line::from(Span::styled(
+            right_lines[3] = Line::from(Span::styled(
                 format!(" API {}", truncate_middle(error, available_width.saturating_sub(6))),
                 Style::default().fg(Color::DarkGray),
             ));
         }
     } else if generation.running == 0 {
         if let Some(duration) = generation.last_duration {
-            lines[2] = Line::from(format!(" Last generation: {}", format_duration(duration)));
+            left_lines[2] = Line::from(vec![Span::raw(" Last generation: "), Span::styled(format_duration(duration), Style::default().fg(app.colors().primary))]);
         }
     }
 
-    frame.render_widget(panel(" GENERATION ", lines), area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .title(Span::styled(" GENERATION ", Style::default().fg(app.colors().primary).add_modifier(Modifier::BOLD)))
+        .border_style(Style::default().fg(app.colors().border));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    if inner.width > 80 {
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(inner);
+        frame.render_widget(Paragraph::new(left_lines), cols[0]);
+        frame.render_widget(Paragraph::new(right_lines), cols[1]);
+    } else {
+        left_lines.extend(right_lines);
+        frame.render_widget(Paragraph::new(left_lines), inner);
+    }
 }
 
 fn render_cpu(frame: &mut Frame, area: Rect, app: &App) {
@@ -2060,8 +2120,13 @@ fn render_cpu(frame: &mut Frame, area: Rect, app: &App) {
 
         let lines = vec![
             usage_line("USAGE", cpu.usage_pct),
-            Line::from(format!(" Temp {temp:<8} │ Avg clock {frequency}")),
-            Line::from(format!(" Load 1/5/15: {load}")),
+            Line::from(vec![
+                Span::raw(" Temp "), Span::styled(format!("{temp:<8}"), if cpu.temp_c.unwrap_or(0.0) >= 80.0 { Style::default().fg(Color::Red) } else { Style::default().fg(app.colors().primary) }),
+                Span::raw(" │ Avg clock "), Span::styled(frequency.clone(), Style::default().fg(app.colors().primary)),
+            ]),
+            Line::from(vec![
+                Span::raw(" Load 1/5/15: "), Span::styled(load.clone(), Style::default().fg(app.colors().primary)),
+            ]),
         ];
         frame.render_widget(Paragraph::new(lines), layout[0]);
 
@@ -2124,24 +2189,23 @@ fn render_gpu(frame: &mut Frame, area: Rect, app: &App) {
             .split(inner);
 
         let lines = vec![
-            Line::from(format!(" {}", gpu.name)),
+            Line::from(vec![Span::styled(format!(" {}", gpu.name), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))]),
             usage_line("USAGE", gpu.utilization_pct.unwrap_or(0.0)),
-            usage_line(
-                "VRAM ",
-                percent(gpu.vram_used.unwrap_or(0), gpu.vram_total.unwrap_or(1)),
-            ),
-            Line::from(format!(
-                " {} / {}",
-                human_bytes(gpu.vram_used.unwrap_or(0)),
-                human_bytes(gpu.vram_total.unwrap_or(0))
-            )),
-            Line::from(format!(
-                " Temp: {}°C │ Power: {}W / {}W",
-                format_optional_decimal(gpu.temperature_c),
-                format_optional_decimal(gpu.power_draw_w),
-                format_optional_decimal(gpu.power_limit_w),
-            )),
-            Line::from(format!(" Pstate: {pstate} │ Clock: {clock} │ Fan: {fan}")),
+            usage_line("VRAM ", percent(gpu.vram_used.unwrap_or(0), gpu.vram_total.unwrap_or(1))),
+            Line::from(vec![
+                Span::raw(" "), Span::styled(human_bytes(gpu.vram_used.unwrap_or(0)), Style::default().fg(app.colors().primary)),
+                Span::raw(" / "), Span::styled(human_bytes(gpu.vram_total.unwrap_or(0)), Style::default().fg(app.colors().primary)),
+            ]),
+            Line::from(vec![
+                Span::raw(" Temp: "), Span::styled(format!("{}°C", format_optional_decimal(gpu.temperature_c)), if gpu.temperature_c.unwrap_or(0.0) >= 80.0 { Style::default().fg(Color::Red) } else { Style::default().fg(app.colors().primary) }),
+                Span::raw(" │ Power: "), Span::styled(format!("{}W", format_optional_decimal(gpu.power_draw_w)), Style::default().fg(app.colors().primary)),
+                Span::raw(" / "), Span::styled(format!("{}W", format_optional_decimal(gpu.power_limit_w)), Style::default().fg(app.colors().primary)),
+            ]),
+            Line::from(vec![
+                Span::raw(" Pstate: "), Span::styled(pstate.to_string(), Style::default().fg(app.colors().primary)),
+                Span::raw(" │ Clock: "), Span::styled(clock.to_string(), Style::default().fg(app.colors().primary)),
+                Span::raw(" │ Fan: "), Span::styled(fan.to_string(), Style::default().fg(app.colors().primary)),
+            ]),
         ];
         frame.render_widget(Paragraph::new(lines), layout[0]);
 
@@ -2160,24 +2224,23 @@ fn render_gpu(frame: &mut Frame, area: Rect, app: &App) {
         frame.render_widget(sparkline, sparkline_inner);
     } else {
         let lines = vec![
-            Line::from(format!(" {}", gpu.name)),
+            Line::from(vec![Span::styled(format!(" {}", gpu.name), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))]),
             usage_line("USAGE", gpu.utilization_pct.unwrap_or(0.0)),
-            usage_line(
-                "VRAM ",
-                percent(gpu.vram_used.unwrap_or(0), gpu.vram_total.unwrap_or(1)),
-            ),
-            Line::from(format!(
-                " {} / {}",
-                human_bytes(gpu.vram_used.unwrap_or(0)),
-                human_bytes(gpu.vram_total.unwrap_or(0))
-            )),
-            Line::from(format!(
-                " Temp: {}°C │ Power: {}W / {}W",
-                format_optional_decimal(gpu.temperature_c),
-                format_optional_decimal(gpu.power_draw_w),
-                format_optional_decimal(gpu.power_limit_w),
-            )),
-            Line::from(format!(" Pstate: {pstate} │ Clock: {clock} │ Fan: {fan}")),
+            usage_line("VRAM ", percent(gpu.vram_used.unwrap_or(0), gpu.vram_total.unwrap_or(1))),
+            Line::from(vec![
+                Span::raw(" "), Span::styled(human_bytes(gpu.vram_used.unwrap_or(0)), Style::default().fg(app.colors().primary)),
+                Span::raw(" / "), Span::styled(human_bytes(gpu.vram_total.unwrap_or(0)), Style::default().fg(app.colors().primary)),
+            ]),
+            Line::from(vec![
+                Span::raw(" Temp: "), Span::styled(format!("{}°C", format_optional_decimal(gpu.temperature_c)), if gpu.temperature_c.unwrap_or(0.0) >= 80.0 { Style::default().fg(Color::Red) } else { Style::default().fg(app.colors().primary) }),
+                Span::raw(" │ Power: "), Span::styled(format!("{}W", format_optional_decimal(gpu.power_draw_w)), Style::default().fg(app.colors().primary)),
+                Span::raw(" / "), Span::styled(format!("{}W", format_optional_decimal(gpu.power_limit_w)), Style::default().fg(app.colors().primary)),
+            ]),
+            Line::from(vec![
+                Span::raw(" Pstate: "), Span::styled(pstate.to_string(), Style::default().fg(app.colors().primary)),
+                Span::raw(" │ Clock: "), Span::styled(clock.to_string(), Style::default().fg(app.colors().primary)),
+                Span::raw(" │ Fan: "), Span::styled(fan.to_string(), Style::default().fg(app.colors().primary)),
+            ]),
         ];
         frame.render_widget(Paragraph::new(lines).block(block), area);
     }
@@ -2312,29 +2375,65 @@ fn render_guard(frame: &mut Frame, area: Rect, app: &App) {
         .map_or_else(|| "N/A".to_owned(), |value| value.to_string());
 
     let lines = vec![
-        Line::from(format!(" {state} │ RAM {current} │ peak {peak}")),
-        Line::from(format!(" High {high} │ max {max} │ free {headroom}")),
-        Line::from(format!(" Scope CPU {scope_cpu} │ tasks {tasks} │ swap {swap}")),
-        Line::from(format!(
-            " Scope I/O ↓{} ↑{}",
-            scope.io_read_bytes.map_or_else(|| "N/A".to_owned(), human_bytes),
-            scope.io_write_bytes.map_or_else(|| "N/A".to_owned(), human_bytes)
-        )),
-        Line::from(format!(
-            " Events high {} │ max {} │ OOM kills {}",
-            format_optional_u64(scope.memory_high_events),
-            format_optional_u64(scope.memory_max_events),
-            format_optional_u64(scope.oom_kill_events)
-        )),
-        Line::from(format!(
-            " Watchdog {} │ floor {} │ {}/{}",
-            if app.config.auto_stop_on_low_memory { "ON" } else { "OFF" },
-            human_bytes(app.config.emergency_ram_floor_mib.saturating_mul(1024 * 1024)),
-            app.low_memory_samples,
-            app.config.emergency_consecutive_samples
-        )),
+        Line::from(vec![
+            Span::raw(" "), Span::styled(state.clone(), Style::default().fg(app.colors().primary).add_modifier(Modifier::BOLD)),
+            Span::raw(" │ RAM "), Span::styled(current.clone(), Style::default().fg(app.colors().primary)),
+            Span::raw(" │ peak "), Span::styled(peak.clone(), Style::default().fg(app.colors().primary)),
+        ]),
+        Line::from(vec![
+            Span::raw(" High "), Span::styled(high.clone(), Style::default().fg(app.colors().primary)),
+            Span::raw(" │ max "), Span::styled(max.clone(), Style::default().fg(app.colors().primary)),
+            Span::raw(" │ free "), Span::styled(headroom.clone(), Style::default().fg(app.colors().primary)),
+        ]),
+        Line::from(vec![
+            Span::raw(" Scope CPU "), Span::styled(scope_cpu.clone(), Style::default().fg(app.colors().primary)),
+            Span::raw(" │ tasks "), Span::styled(tasks.clone(), Style::default().fg(app.colors().primary)),
+            Span::raw(" │ swap "), Span::styled(swap.clone(), Style::default().fg(app.colors().primary)),
+        ]),
+        Line::from(vec![
+            Span::raw(" Scope I/O ↓"), Span::styled(scope.io_read_bytes.map_or_else(|| "N/A".to_owned(), human_bytes), Style::default().fg(app.colors().primary)),
+            Span::raw(" ↑"), Span::styled(scope.io_write_bytes.map_or_else(|| "N/A".to_owned(), human_bytes), Style::default().fg(app.colors().primary)),
+        ]),
+        Line::from(vec![
+            Span::raw(" Events high "), Span::styled(format_optional_u64(scope.memory_high_events), Style::default().fg(if scope.memory_high_events.unwrap_or(0) > 0 { Color::Yellow } else { app.colors().primary })),
+            Span::raw(" │ max "), Span::styled(format_optional_u64(scope.memory_max_events), Style::default().fg(if scope.memory_max_events.unwrap_or(0) > 0 { Color::Red } else { app.colors().primary })),
+            Span::raw(" │ OOM kills "), Span::styled(format_optional_u64(scope.oom_kill_events), Style::default().fg(if scope.oom_kill_events.unwrap_or(0) > 0 { Color::Red } else { app.colors().primary })),
+        ]),
+        Line::from(vec![
+            Span::raw(" Watchdog "), Span::styled(if app.config.auto_stop_on_low_memory { "ON" } else { "OFF" }, Style::default().fg(if app.config.auto_stop_on_low_memory { Color::Green } else { Color::DarkGray })),
+            Span::raw(" │ floor "), Span::styled(human_bytes(app.config.emergency_ram_floor_mib.saturating_mul(1024 * 1024)), Style::default().fg(app.colors().primary)),
+            Span::raw(" │ "), Span::styled(format!("{}/{}", app.low_memory_samples, app.config.emergency_consecutive_samples), Style::default().fg(app.colors().primary)),
+        ]),
     ];
-    frame.render_widget(panel(" COMFYUI RESOURCE GUARD ", lines), area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .title(Span::styled(" COMFYUI RESOURCE GUARD ", Style::default().fg(app.colors().primary).add_modifier(Modifier::BOLD)))
+        .border_style(Style::default().fg(app.colors().border));
+    if app.config.sparklines_enabled {
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        let layout = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(70), Constraint::Percentage(30)])
+            .split(inner);
+        frame.render_widget(Paragraph::new(lines), layout[0]);
+
+        let max_val = scope.memory_max.unwrap_or(scope.memory_current.unwrap_or(1));
+        let max_val = if max_val == 0 { 1 } else { max_val };
+        let memory_gauge = ratatui::widgets::Gauge::default()
+            .block(Block::default()
+                .borders(Borders::LEFT)
+                .border_style(Style::default().fg(Color::DarkGray))
+                .title(Span::styled(" RAM ", Style::default().fg(Color::DarkGray)))
+            )
+            .gauge_style(Style::default().fg(app.colors().primary))
+            .ratio((scope.memory_current.unwrap_or(0) as f64 / max_val as f64).clamp(0.0, 1.0));
+        frame.render_widget(memory_gauge, layout[1]);
+    } else {
+        frame.render_widget(Paragraph::new(lines).block(block), area);
+    }
 }
 
 fn render_insights(frame: &mut Frame, area: Rect, app: &App) {
